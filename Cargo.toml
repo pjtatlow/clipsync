@@ -39,4 +39,5 @@ futures = "0.3"
 service-manager = "0.7"
 libc = "0.2"
 spacetimedb-sdk = "2.0"
+openssl = { version = "0.10", features = ["vendored"], optional = true }
 gethostname = "0.5"
