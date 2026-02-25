@@ -42,7 +42,7 @@ jobs:
         run: |
           # The module_bindings are gitignored, so we need to generate them.
           # Install spacetime CLI
-          curl -sSf https://install.spacetimedb.com | bash
+          curl -sSf https://install.spacetimedb.com | bash -s -- -y
           export PATH="$HOME/.local/bin:$PATH"
           spacetime generate --lang rust --out-dir src/module_bindings --module-path ./server
 
