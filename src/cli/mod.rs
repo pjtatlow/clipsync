@@ -1,3 +1,4 @@
+pub mod config;
 pub mod copy;
 pub mod devices;
 pub mod install;

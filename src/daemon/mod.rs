@@ -47,7 +47,6 @@ pub async fn run_daemon(config: Config) -> Result<()> {
 
     // State
     let mut connected = false;
-    let watching = config.watch_clipboard;
 
     // Load encryption identity
     let age_identity = match crypto::load_private_key() {
@@ -57,6 +56,8 @@ pub async fn run_daemon(config: Config) -> Result<()> {
             None
         }
     };
+
+    let watching = config.watch_clipboard;
 
     info!("Daemon main loop started (watching={})", watching);
 

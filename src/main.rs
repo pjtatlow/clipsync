@@ -32,6 +32,13 @@ enum Command {
     Status,
     /// List registered devices
     Devices,
+    /// Get or set config values
+    Config {
+        /// Config key (watch_clipboard, poll_interval_ms, server_url, database_name)
+        key: Option<String>,
+        /// Value to set (omit to read current value)
+        value: Option<String>,
+    },
     /// Install as a system service
     Install,
     /// Remove the system service
@@ -59,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Paste => cli::paste::run().await?,
         Command::Status => cli::status::run().await?,
         Command::Devices => cli::devices::run().await?,
+        Command::Config { key, value } => cli::config::run(key, value)?,
         Command::Install => cli::install::install().await?,
         Command::Uninstall => cli::install::uninstall().await?,
     }
