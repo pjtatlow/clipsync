@@ -5,6 +5,7 @@ pub mod install;
 pub mod paste;
 pub mod setup;
 pub mod status;
+pub mod xclip;
 
 use anyhow::{Context, Result};
 use bytes::BytesMut;

@@ -8,6 +8,7 @@ edition = "2024"
 description = "Clipboard sync across machines using SpacetimeDB with E2E encryption"
 license = "MIT"
 repository = "https://github.com/pjtatlow/clipsync"
+homepage = "https://github.com/pjtatlow/clipsync"
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"
@@ -42,3 +43,8 @@ openssl = { version = "0.10", features = ["vendored"], optional = true }
 gethostname = "0.5"
 rpassword = "7"
 sha2 = "0.10"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

@@ -43,6 +43,12 @@ enum Command {
         /// Value to set (omit to read current value)
         value: Option<String>,
     },
+    /// Behave like xclip, backed by clipsync (for use as: alias xclip='clipsync xclip')
+    #[command(trailing_var_arg = true, allow_hyphen_values = true)]
+    Xclip {
+        /// Arguments passed to xclip
+        args: Vec<String>,
+    },
     /// Install as a system service
     Install,
     /// Remove the system service
@@ -71,6 +77,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Status => cli::status::run().await?,
         Command::Devices => cli::devices::run().await?,
         Command::Config { key, value } => cli::config::run(key, value)?,
+        Command::Xclip { args } => cli::xclip::run(args).await?,
         Command::Install => cli::install::install().await?,
         Command::Uninstall => cli::install::uninstall().await?,
     }

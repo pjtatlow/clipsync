@@ -1,0 +1,5 @@
+- name: Install SpacetimeDB CLI
+  shell: bash
+  run: |
+    curl -sSf https://install.spacetimedb.com | bash -s -- -y
+    echo "$HOME/.local/bin" >> $GITHUB_PATH
