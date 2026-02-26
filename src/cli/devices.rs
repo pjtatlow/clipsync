@@ -10,16 +10,10 @@ pub async fn run() -> Result<()> {
             if devices.is_empty() {
                 println!("No devices registered");
             } else {
-                println!("{:<6} {:<38} {:<20} {}", "ID", "Device ID", "Name", "Owner");
-                println!("{}", "-".repeat(80));
+                println!("{:<6} {:<38} {:<20}", "ID", "Device ID", "Name");
+                println!("{}", "-".repeat(64));
                 for d in devices {
-                    println!(
-                        "{:<6} {:<38} {:<20} {}",
-                        d.id,
-                        d.device_id,
-                        d.device_name,
-                        &d.owner[..16]
-                    );
+                    println!("{:<6} {:<38} {:<20}", d.id, d.device_id, d.device_name);
                 }
             }
         }

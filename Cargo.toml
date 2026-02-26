@@ -3,7 +3,7 @@ members = ["server"]
 
 [package]
 name = "clipsync"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 description = "Clipboard sync across machines using SpacetimeDB with E2E encryption"
 license = "MIT"
@@ -41,3 +41,5 @@ libc = "0.2"
 spacetimedb-sdk = "2.0"
 openssl = { version = "0.10", features = ["vendored"], optional = true }
 gethostname = "0.5"
+rpassword = "7"
+sha2 = "0.10"

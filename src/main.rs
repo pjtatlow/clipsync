@@ -19,22 +19,20 @@ struct Cli {
 enum Command {
     /// Start the daemon (foreground)
     Daemon,
-    /// Authenticate with SpacetimeDB
-    Login,
-    /// Generate keys and register device
-    Setup {
-        /// Name for this device
-        device_name: String,
+    /// Create a new account and register this device
+    Signup {
+        /// Username for the new account
+        username: String,
+    },
+    /// Log in to an existing account and register this device
+    Login {
+        /// Username of the existing account
+        username: String,
     },
     /// Sync clipboard content to SpacetimeDB
     Copy,
     /// Get latest clip from SpacetimeDB
     Paste,
-    /// Send current clip to another user
-    Send {
-        /// Recipient identity (hex string)
-        recipient: String,
-    },
     /// Show daemon status
     Status,
     /// List registered devices
@@ -61,11 +59,10 @@ async fn main() -> anyhow::Result<()> {
             let config = config::Config::load().unwrap_or_default();
             daemon::run_daemon(config).await?;
         }
-        Command::Login => cli::login::run().await?,
-        Command::Setup { device_name } => cli::setup::run(device_name).await?,
+        Command::Signup { username } => cli::signup::run(username).await?,
+        Command::Login { username } => cli::login::run(username).await?,
         Command::Copy => cli::copy::run().await?,
         Command::Paste => cli::paste::run().await?,
-        Command::Send { recipient } => cli::send::run(recipient).await?,
         Command::Status => cli::status::run().await?,
         Command::Devices => cli::devices::run().await?,
         Command::Install => cli::install::install().await?,

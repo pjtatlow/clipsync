@@ -3,7 +3,6 @@ pub mod socket;
 pub mod spacetime;
 
 use anyhow::Result;
-use spacetimedb_sdk::Identity;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
 
@@ -19,10 +18,12 @@ use self::spacetime::{SpacetimeCommand, SpacetimeEvent};
 
 pub async fn run_daemon(config: Config) -> Result<()> {
     let device_id = config::load_device_id()?
-        .ok_or_else(|| anyhow::anyhow!("Device not set up. Run `clipsync setup <name>` first."))?;
+        .ok_or_else(|| anyhow::anyhow!("Device not set up. Run `clipsync signup` or `clipsync login` first."))?;
     let token = config::load_token()?;
+    let user_id = config::load_user_id()?
+        .ok_or_else(|| anyhow::anyhow!("Not logged in. Run `clipsync signup` or `clipsync login` first."))?;
 
-    info!("Starting daemon with device_id={}", device_id);
+    info!("Starting daemon with device_id={}, user_id={}", device_id, user_id);
 
     // Channels for SpacetimeDB
     let (stdb_event_tx, mut stdb_event_rx) = mpsc::channel::<SpacetimeEvent>(32);
@@ -36,7 +37,7 @@ pub async fn run_daemon(config: Config) -> Result<()> {
     let (socket_req_tx, mut socket_req_rx) = mpsc::channel::<SocketRequest>(32);
 
     // Spawn SpacetimeDB connection thread
-    spacetime::spawn_spacetime_thread(&config, token, stdb_event_tx, stdb_cmd_rx)?;
+    spacetime::spawn_spacetime_thread(&config, token, user_id, stdb_event_tx, stdb_cmd_rx)?;
 
     // Spawn clipboard watcher thread
     clipboard::spawn_clipboard_watcher(config.poll_interval_ms, clip_event_tx, clip_cmd_rx)?;
@@ -46,14 +47,13 @@ pub async fn run_daemon(config: Config) -> Result<()> {
 
     // State
     let mut connected = false;
-    let mut identity: Option<Identity> = None;
     let watching = config.watch_clipboard;
 
     // Load encryption identity
     let age_identity = match crypto::load_private_key() {
         Ok(id) => Some(id),
         Err(e) => {
-            warn!("Failed to load private key (run `clipsync setup`): {}", e);
+            warn!("Failed to load private key: {}", e);
             None
         }
     };
@@ -68,22 +68,13 @@ pub async fn run_daemon(config: Config) -> Result<()> {
                     SpacetimeEvent::Connected { identity: id, token: tok } => {
                         info!("Connected as {}", id.to_hex());
                         connected = true;
-                        identity = Some(id);
 
                         // Save the token
                         if let Err(e) = config::save_token(&tok) {
                             warn!("Failed to save token: {}", e);
                         }
 
-                        // Register our key and device
-                        if let Some(age_id) = &age_identity {
-                            let recipient = age_id.to_public();
-                            let pub_key_bytes = crypto::public_key_bytes(&recipient);
-                            let _ = stdb_cmd_tx.send(SpacetimeCommand::RegisterKey {
-                                public_key: pub_key_bytes,
-                            });
-                        }
-
+                        // Register our device
                         let _ = stdb_cmd_tx.send(SpacetimeCommand::RegisterDevice {
                             device_id: device_id.clone(),
                             device_name: hostname(),
@@ -165,7 +156,7 @@ pub async fn run_daemon(config: Config) -> Result<()> {
                 let response = handle_request(
                     req.request,
                     connected,
-                    identity,
+                    user_id,
                     &device_id,
                     watching,
                     &age_identity,
@@ -197,7 +188,7 @@ pub async fn run_daemon(config: Config) -> Result<()> {
 async fn handle_request(
     request: Request,
     connected: bool,
-    identity: Option<Identity>,
+    user_id: u64,
     device_id: &str,
     watching: bool,
     age_identity: &Option<age::x25519::Identity>,
@@ -205,12 +196,23 @@ async fn handle_request(
     clip_cmd_tx: &std::sync::mpsc::Sender<ClipboardCommand>,
 ) -> Response {
     match request {
-        Request::Status => Response::Status {
-            connected,
-            identity: identity.map(|id| id.to_hex().to_string()),
-            device_id: device_id.to_string(),
-            watching,
-        },
+        Request::Status => {
+            // Look up username from SpacetimeDB
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let _ = stdb_cmd_tx.send(SpacetimeCommand::GetUsername {
+                user_id,
+                reply: reply_tx,
+            });
+            let username = reply_rx.await.ok().flatten();
+
+            Response::Status {
+                connected,
+                username,
+                user_id: Some(user_id),
+                device_id: device_id.to_string(),
+                watching,
+            }
+        }
 
         Request::Copy { data } => {
             let payload = if let Some(data) = data {
@@ -279,7 +281,7 @@ async fn handle_request(
                 }
             } else {
                 Response::Error {
-                    message: "No encryption key configured. Run `clipsync setup`.".to_string(),
+                    message: "No encryption key configured. Run `clipsync signup` or `clipsync login`.".to_string(),
                 }
             }
         }
@@ -292,7 +294,10 @@ async fn handle_request(
             }
 
             let (reply_tx, reply_rx) = oneshot::channel();
-            let _ = stdb_cmd_tx.send(SpacetimeCommand::GetCurrentClip { reply: reply_tx });
+            let _ = stdb_cmd_tx.send(SpacetimeCommand::GetCurrentClip {
+                user_id,
+                reply: reply_tx,
+            });
 
             match reply_rx.await {
                 Ok(Some(clip)) => {
@@ -347,102 +352,12 @@ async fn handle_request(
             }
         }
 
-        Request::Send { recipient } => {
-            if !connected {
-                return Response::Error {
-                    message: "Not connected to SpacetimeDB".to_string(),
-                };
-            }
-
-            // Parse recipient identity
-            let recipient_id = match Identity::from_hex(&recipient) {
-                Ok(id) => id,
-                Err(e) => {
-                    return Response::Error {
-                        message: format!("Invalid recipient identity: {}", e),
-                    }
-                }
-            };
-
-            // Look up recipient's public key
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let _ = stdb_cmd_tx.send(SpacetimeCommand::LookupKey {
-                identity: recipient_id,
-                reply: reply_tx,
-            });
-
-            let recipient_key_bytes = match reply_rx.await {
-                Ok(Some(bytes)) => bytes,
-                Ok(None) => {
-                    return Response::Error {
-                        message: "Recipient has no registered public key".to_string(),
-                    }
-                }
-                Err(_) => {
-                    return Response::Error {
-                        message: "Failed to look up recipient key".to_string(),
-                    }
-                }
-            };
-
-            let recipient_age = match crypto::recipient_from_bytes(&recipient_key_bytes) {
-                Ok(r) => r,
-                Err(e) => {
-                    return Response::Error {
-                        message: format!("Invalid recipient public key: {}", e),
-                    }
-                }
-            };
-
-            // Get our current clip
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let _ = stdb_cmd_tx.send(SpacetimeCommand::GetCurrentClip { reply: reply_tx });
-
-            match reply_rx.await {
-                Ok(Some(clip)) => {
-                    if let Some(age_id) = age_identity {
-                        // Decrypt our clip, then re-encrypt for recipient
-                        match crypto::decrypt(&clip.encrypted_data, age_id) {
-                            Ok(plaintext) => {
-                                let size_bytes = plaintext.len() as u64;
-                                match crypto::encrypt(&plaintext, vec![recipient_age]) {
-                                    Ok(encrypted) => {
-                                        let _ =
-                                            stdb_cmd_tx.send(SpacetimeCommand::SendClip {
-                                                recipient: recipient_id,
-                                                content_type: clip.content_type,
-                                                encrypted_data: encrypted,
-                                                size_bytes,
-                                            });
-                                        Response::Ok
-                                    }
-                                    Err(e) => Response::Error {
-                                        message: format!("Encryption failed: {}", e),
-                                    },
-                                }
-                            }
-                            Err(e) => Response::Error {
-                                message: format!("Failed to decrypt own clip: {}", e),
-                            },
-                        }
-                    } else {
-                        Response::Error {
-                            message: "No encryption key configured".to_string(),
-                        }
-                    }
-                }
-                Ok(None) => Response::Error {
-                    message: "No clip to send".to_string(),
-                },
-                Err(_) => Response::Error {
-                    message: "Failed to get clip".to_string(),
-                },
-            }
-        }
-
         Request::ListDevices => {
             let (reply_tx, reply_rx) = oneshot::channel();
-            let _ = stdb_cmd_tx.send(SpacetimeCommand::ListDevices { reply: reply_tx });
+            let _ = stdb_cmd_tx.send(SpacetimeCommand::ListDevices {
+                user_id,
+                reply: reply_tx,
+            });
 
             match reply_rx.await {
                 Ok(devices) => Response::Devices {
@@ -452,52 +367,12 @@ async fn handle_request(
                             id: d.id,
                             device_id: d.device_id,
                             device_name: d.device_name,
-                            owner: d.owner.to_hex().to_string(),
                         })
                         .collect(),
                 },
                 Err(_) => Response::Error {
                     message: "Failed to list devices".to_string(),
                 },
-            }
-        }
-
-        Request::GetPublicKey { identity: id_str } => {
-            if let Some(id_str) = id_str {
-                let target_id = match Identity::from_hex(&id_str) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        return Response::Error {
-                            message: format!("Invalid identity: {}", e),
-                        }
-                    }
-                };
-
-                let (reply_tx, reply_rx) = oneshot::channel();
-                let _ = stdb_cmd_tx.send(SpacetimeCommand::LookupKey {
-                    identity: target_id,
-                    reply: reply_tx,
-                });
-
-                match reply_rx.await {
-                    Ok(Some(bytes)) => Response::PublicKey {
-                        key: String::from_utf8_lossy(&bytes).to_string(),
-                    },
-                    Ok(None) => Response::Error {
-                        message: "No public key found for identity".to_string(),
-                    },
-                    Err(_) => Response::Error {
-                        message: "Failed to look up key".to_string(),
-                    },
-                }
-            } else if let Some(age_id) = age_identity {
-                Response::PublicKey {
-                    key: age_id.to_public().to_string(),
-                }
-            } else {
-                Response::Error {
-                    message: "No encryption key configured".to_string(),
-                }
             }
         }
 

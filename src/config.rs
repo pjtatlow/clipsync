@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    #[serde(default)]
+    #[serde(default = "default_watch_clipboard")]
     pub watch_clipboard: bool,
     #[serde(default = "default_poll_interval")]
     pub poll_interval_ms: u64,
@@ -12,6 +12,10 @@ pub struct Config {
     pub server_url: String,
     #[serde(default = "default_database_name")]
     pub database_name: String,
+}
+
+fn default_watch_clipboard() -> bool {
+    true
 }
 
 fn default_poll_interval() -> u64 {
@@ -29,7 +33,7 @@ fn default_database_name() -> String {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            watch_clipboard: false,
+            watch_clipboard: true,
             poll_interval_ms: default_poll_interval(),
             server_url: default_server_url(),
             database_name: default_database_name(),
@@ -114,6 +118,33 @@ pub fn save_token(token: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn user_id_path() -> PathBuf {
+    config_dir().join("user_id")
+}
+
+pub fn load_user_id() -> Result<Option<u64>> {
+    let path = user_id_path();
+    if path.exists() {
+        let id_str = std::fs::read_to_string(&path)
+            .with_context(|| "Failed to read user_id")?
+            .trim()
+            .to_string();
+        let id: u64 = id_str
+            .parse()
+            .with_context(|| "Failed to parse user_id")?;
+        Ok(Some(id))
+    } else {
+        Ok(None)
+    }
+}
+
+pub fn save_user_id(user_id: u64) -> Result<()> {
+    let path = user_id_path();
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    std::fs::write(&path, user_id.to_string()).with_context(|| "Failed to write user_id")?;
+    Ok(())
+}
+
 pub fn socket_path() -> PathBuf {
     if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
         return PathBuf::from(runtime_dir).join("clipsync.sock");
@@ -139,7 +170,7 @@ mod tests {
     #[test]
     fn default_config_values() {
         let config = Config::default();
-        assert!(!config.watch_clipboard);
+        assert!(config.watch_clipboard);
         assert_eq!(config.poll_interval_ms, 500);
         assert_eq!(config.database_name, "clipsync");
     }

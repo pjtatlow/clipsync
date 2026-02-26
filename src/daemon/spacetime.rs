@@ -9,8 +9,6 @@ use crate::module_bindings::*;
 
 // Import reducer extension traits
 use crate::module_bindings::register_device_reducer::register_device;
-use crate::module_bindings::register_key_reducer::register_key;
-use crate::module_bindings::send_clip_reducer::send_clip;
 use crate::module_bindings::sync_clip_reducer::sync_clip;
 
 // Events sent from SpacetimeDB thread to main loop
@@ -33,34 +31,28 @@ pub enum SpacetimeCommand {
         encrypted_data: Vec<u8>,
         size_bytes: u64,
     },
-    SendClip {
-        recipient: Identity,
-        content_type: ClipContentType,
-        encrypted_data: Vec<u8>,
-        size_bytes: u64,
-    },
-    RegisterKey {
-        public_key: Vec<u8>,
-    },
     RegisterDevice {
         device_id: String,
         device_name: String,
     },
     ListDevices {
+        user_id: u64,
         reply: oneshot::Sender<Vec<Device>>,
     },
-    LookupKey {
-        identity: Identity,
-        reply: oneshot::Sender<Option<Vec<u8>>>,
-    },
     GetCurrentClip {
+        user_id: u64,
         reply: oneshot::Sender<Option<CurrentClip>>,
+    },
+    GetUsername {
+        user_id: u64,
+        reply: oneshot::Sender<Option<String>>,
     },
 }
 
 pub fn spawn_spacetime_thread(
     config: &Config,
     token: Option<String>,
+    user_id: u64,
     event_tx: mpsc::Sender<SpacetimeEvent>,
     command_rx: crossbeam_channel::Receiver<SpacetimeCommand>,
 ) -> Result<()> {
@@ -90,6 +82,7 @@ pub fn spawn_spacetime_thread(
                     // Subscribe to all tables
                     let event_tx_for_sub = event_tx_sub.clone();
                     let event_tx_for_clip = event_tx_clip.clone();
+                    let uid = user_id;
 
                     conn.subscription_builder()
                         .on_applied(move |ctx: &SubscriptionEventContext| {
@@ -99,14 +92,19 @@ pub fn spawn_spacetime_thread(
 
                             // Register callbacks for clip updates
                             let tx = event_tx_for_clip.clone();
+                            let uid_for_update = uid;
                             ctx.db.current_clip().on_update(move |_ctx: &EventContext, _old: &CurrentClip, new: &CurrentClip| {
-                                let _ = tx.blocking_send(SpacetimeEvent::ClipUpdated(new.clone()));
+                                if new.user_id == uid_for_update {
+                                    let _ = tx.blocking_send(SpacetimeEvent::ClipUpdated(new.clone()));
+                                }
                             });
 
                             let tx2 = event_tx_for_clip.clone();
+                            let uid_for_insert = uid;
                             ctx.db.current_clip().on_insert(move |_ctx: &EventContext, row: &CurrentClip| {
-                                let _ =
-                                    tx2.blocking_send(SpacetimeEvent::ClipUpdated(row.clone()));
+                                if row.user_id == uid_for_insert {
+                                    let _ = tx2.blocking_send(SpacetimeEvent::ClipUpdated(row.clone()));
+                                }
                             });
                         })
                         .subscribe_to_all_tables();
@@ -147,26 +145,6 @@ pub fn spawn_spacetime_thread(
                                 error!("Failed to call sync_clip: {}", e);
                             }
                         }
-                        SpacetimeCommand::SendClip {
-                            recipient,
-                            content_type,
-                            encrypted_data,
-                            size_bytes,
-                        } => {
-                            if let Err(e) = conn.reducers.send_clip(
-                                recipient,
-                                content_type,
-                                encrypted_data,
-                                size_bytes,
-                            ) {
-                                error!("Failed to call send_clip: {}", e);
-                            }
-                        }
-                        SpacetimeCommand::RegisterKey { public_key } => {
-                            if let Err(e) = conn.reducers.register_key(public_key) {
-                                error!("Failed to call register_key: {}", e);
-                            }
-                        }
                         SpacetimeCommand::RegisterDevice {
                             device_id,
                             device_name,
@@ -177,24 +155,27 @@ pub fn spawn_spacetime_thread(
                                 error!("Failed to call register_device: {}", e);
                             }
                         }
-                        SpacetimeCommand::ListDevices { reply } => {
-                            let devices: Vec<Device> = conn.db.device().iter().collect();
+                        SpacetimeCommand::ListDevices { user_id, reply } => {
+                            let devices: Vec<Device> = conn
+                                .db
+                                .device()
+                                .iter()
+                                .filter(|d| d.user_id == user_id)
+                                .collect();
                             let _ = reply.send(devices);
                         }
-                        SpacetimeCommand::LookupKey { identity, reply } => {
-                            let key = conn
-                                .db
-                                .user_key()
-                                .identity()
-                                .find(&identity)
-                                .map(|uk| uk.public_key.clone());
-                            let _ = reply.send(key);
-                        }
-                        SpacetimeCommand::GetCurrentClip { reply } => {
-                            let clip = conn.try_identity().and_then(|id| {
-                                conn.db.current_clip().owner().find(&id)
-                            });
+                        SpacetimeCommand::GetCurrentClip { user_id, reply } => {
+                            let clip = conn.db.current_clip().user_id().find(&user_id);
                             let _ = reply.send(clip);
+                        }
+                        SpacetimeCommand::GetUsername { user_id, reply } => {
+                            let username = conn
+                                .db
+                                .user()
+                                .id()
+                                .find(&user_id)
+                                .map(|u| u.username.clone());
+                            let _ = reply.send(username);
                         }
                     },
                     Err(_) => {

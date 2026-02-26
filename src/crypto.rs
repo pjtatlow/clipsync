@@ -59,6 +59,44 @@ pub fn load_private_key() -> Result<x25519::Identity> {
     Ok(identity)
 }
 
+pub fn encrypt_with_passphrase(data: &[u8], passphrase: &str) -> Result<Vec<u8>> {
+    let encryptor = age::Encryptor::with_user_passphrase(
+        age::secrecy::SecretString::from(passphrase.to_string()),
+    );
+
+    let mut encrypted = vec![];
+    let mut writer = encryptor
+        .wrap_output(&mut encrypted)
+        .with_context(|| "Failed to create age passphrase writer")?;
+    writer
+        .write_all(data)
+        .with_context(|| "Failed to write passphrase-encrypted data")?;
+    writer
+        .finish()
+        .with_context(|| "Failed to finish passphrase encryption")?;
+
+    Ok(encrypted)
+}
+
+pub fn decrypt_with_passphrase(encrypted: &[u8], passphrase: &str) -> Result<Vec<u8>> {
+    let decryptor = age::Decryptor::new(encrypted)
+        .map_err(|e| anyhow::anyhow!("Failed to create passphrase decryptor: {}", e))?;
+
+    let identity = age::scrypt::Identity::new(
+        age::secrecy::SecretString::from(passphrase.to_string()),
+    );
+
+    let mut decrypted = vec![];
+    let mut reader = decryptor
+        .decrypt(std::iter::once(&identity as &dyn age::Identity))
+        .map_err(|e| anyhow::anyhow!("Failed to decrypt with passphrase: {}", e))?;
+    reader
+        .read_to_end(&mut decrypted)
+        .with_context(|| "Failed to read passphrase-decrypted data")?;
+
+    Ok(decrypted)
+}
+
 pub fn encrypt(data: &[u8], recipients: Vec<x25519::Recipient>) -> Result<Vec<u8>> {
     // Compress with zstd first
     let compressed = zstd::encode_all(data, 3).with_context(|| "zstd compression failed")?;
@@ -115,12 +153,6 @@ pub fn public_key_bytes(recipient: &x25519::Recipient) -> Vec<u8> {
     recipient.to_string().into_bytes()
 }
 
-pub fn recipient_from_bytes(bytes: &[u8]) -> Result<x25519::Recipient> {
-    let s = std::str::from_utf8(bytes).with_context(|| "Invalid UTF-8 in public key")?;
-    s.parse()
-        .map_err(|e| anyhow::anyhow!("Failed to parse recipient: {}", e))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,10 +180,14 @@ mod tests {
     }
 
     #[test]
-    fn public_key_bytes_round_trip() {
-        let (_identity, recipient) = generate_keypair();
-        let bytes = public_key_bytes(&recipient);
-        let recovered = recipient_from_bytes(&bytes).unwrap();
-        assert_eq!(recovered.to_string(), recipient.to_string());
+    fn passphrase_encrypt_decrypt_round_trip() {
+        let plaintext = b"secret age private key data";
+        let passphrase = "mypassword123";
+
+        let encrypted = encrypt_with_passphrase(plaintext, passphrase).unwrap();
+        assert_ne!(encrypted, plaintext);
+
+        let decrypted = decrypt_with_passphrase(&encrypted, passphrase).unwrap();
+        assert_eq!(decrypted, plaintext);
     }
 }
