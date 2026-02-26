@@ -15,18 +15,11 @@ pub fn identity_file_path() -> std::path::PathBuf {
 }
 
 pub fn store_private_key(identity: &x25519::Identity) -> Result<()> {
-    // Try OS keyring first
-    if let Ok(entry) = keyring::Entry::new("clipsync", "identity") {
-        let key_str = identity.to_string().expose_secret().to_string();
-        if entry.set_password(&key_str).is_ok() {
-            return Ok(());
-        }
-    }
+    let key_str = identity.to_string().expose_secret().to_string();
 
-    // Fallback to file
+    // Always write to file as the reliable store
     let path = identity_file_path();
     std::fs::create_dir_all(path.parent().unwrap())?;
-    let key_str = identity.to_string().expose_secret().to_string();
     std::fs::write(&path, &key_str).with_context(|| "Failed to write identity file")?;
 
     // Set restrictive permissions on Unix
@@ -34,6 +27,11 @@ pub fn store_private_key(identity: &x25519::Identity) -> Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    // Also try OS keyring as a bonus
+    if let Ok(entry) = keyring::Entry::new("clipsync", "identity") {
+        let _ = entry.set_password(&key_str);
     }
 
     Ok(())
