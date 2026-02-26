@@ -1,11 +1,15 @@
 use serde::{Deserialize, Serialize};
 
+/// Maximum IPC frame size (64 MB).
+pub const MAX_IPC_FRAME_SIZE: usize = 64 * 1024 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
     Status,
     Copy { data: Option<Vec<u8>> },
     Paste,
     ListDevices,
+    CreateInvite { code: String },
     Shutdown,
 }
 
@@ -32,6 +36,9 @@ pub enum Response {
     },
     Devices {
         devices: Vec<DeviceInfo>,
+    },
+    InviteCreated {
+        code: String,
     },
     Error {
         message: String,

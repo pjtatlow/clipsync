@@ -1,7 +1,6 @@
 use anyhow::Result;
 use std::io::{IsTerminal, Write};
 
-use crate::payload::ClipboardPayload;
 use crate::protocol::{Request, Response};
 
 pub async fn run(type_only: bool) -> Result<()> {
@@ -25,16 +24,6 @@ pub async fn run(type_only: bool) -> Result<()> {
                         );
                     } else {
                         std::io::stdout().write_all(&data)?;
-                    }
-                }
-                "files" => {
-                    let payload: ClipboardPayload = ClipboardPayload::deserialize(&data)?;
-                    if let ClipboardPayload::Files(files) = payload {
-                        for file in files {
-                            let path = std::path::Path::new(&file.name);
-                            std::fs::write(path, &file.data)?;
-                            eprintln!("Wrote {}", file.name);
-                        }
                     }
                 }
                 _ => {

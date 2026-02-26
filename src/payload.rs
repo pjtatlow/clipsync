@@ -1,5 +1,9 @@
 use anyhow::{Context, Result};
+use bincode::Options;
 use serde::{Deserialize, Serialize};
+
+/// Maximum payload size for bincode serialization (64 MB).
+const MAX_PAYLOAD_SIZE: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClipboardPayload {
@@ -9,29 +13,27 @@ pub enum ClipboardPayload {
         height: u32,
         png_data: Vec<u8>,
     },
-    Files(Vec<FileEntry>),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileEntry {
-    pub name: String,
-    pub data: Vec<u8>,
 }
 
 impl ClipboardPayload {
     pub fn serialize(&self) -> Result<Vec<u8>> {
-        bincode::serialize(self).with_context(|| "Failed to serialize clipboard payload")
+        bincode::DefaultOptions::new()
+            .with_limit(MAX_PAYLOAD_SIZE)
+            .serialize(self)
+            .with_context(|| "Failed to serialize clipboard payload")
     }
 
     pub fn deserialize(data: &[u8]) -> Result<Self> {
-        bincode::deserialize(data).with_context(|| "Failed to deserialize clipboard payload")
+        bincode::DefaultOptions::new()
+            .with_limit(MAX_PAYLOAD_SIZE)
+            .deserialize(data)
+            .with_context(|| "Failed to deserialize clipboard payload")
     }
 
     pub fn content_type_str(&self) -> &'static str {
         match self {
             ClipboardPayload::Text(_) => "text",
             ClipboardPayload::Image { .. } => "image",
-            ClipboardPayload::Files(_) => "files",
         }
     }
 }
@@ -94,32 +96,6 @@ mod tests {
     }
 
     #[test]
-    fn serialize_deserialize_files() {
-        let payload = ClipboardPayload::Files(vec![
-            FileEntry {
-                name: "test.txt".to_string(),
-                data: b"content".to_vec(),
-            },
-            FileEntry {
-                name: "other.bin".to_string(),
-                data: vec![0xFF, 0x00],
-            },
-        ]);
-        let data = payload.serialize().unwrap();
-        let recovered = ClipboardPayload::deserialize(&data).unwrap();
-        match recovered {
-            ClipboardPayload::Files(files) => {
-                assert_eq!(files.len(), 2);
-                assert_eq!(files[0].name, "test.txt");
-                assert_eq!(files[0].data, b"content");
-                assert_eq!(files[1].name, "other.bin");
-                assert_eq!(files[1].data, vec![0xFF, 0x00]);
-            }
-            _ => panic!("Expected Files variant"),
-        }
-    }
-
-    #[test]
     fn rgba_to_png_to_rgba_round_trip() {
         let width = 4u32;
         let height = 4u32;
@@ -156,10 +132,6 @@ mod tests {
             }
             .content_type_str(),
             "image"
-        );
-        assert_eq!(
-            ClipboardPayload::Files(vec![]).content_type_str(),
-            "files"
         );
     }
 }

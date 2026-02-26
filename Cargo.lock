@@ -489,7 +489,6 @@ dependencies = [
  "serde",
  "serde_json",
  "service-manager",
- "sha2",
  "spacetimedb-sdk",
  "thiserror 2.0.18",
  "tokio",

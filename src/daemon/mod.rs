@@ -3,7 +3,7 @@ pub mod socket;
 pub mod spacetime;
 
 use anyhow::Result;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{error, info, warn};
 
 use crate::config::{self, Config};
@@ -37,10 +37,13 @@ pub async fn run_daemon(config: Config) -> Result<()> {
     let (socket_req_tx, mut socket_req_rx) = mpsc::channel::<SocketRequest>(32);
 
     // Spawn SpacetimeDB connection thread
-    spacetime::spawn_spacetime_thread(&config, token, user_id, stdb_event_tx, stdb_cmd_rx)?;
+    spacetime::spawn_spacetime_thread(&config, token, stdb_event_tx, stdb_cmd_rx)?;
 
     // Spawn clipboard watcher thread
     clipboard::spawn_clipboard_watcher(config.poll_interval_ms, clip_event_tx, clip_cmd_rx)?;
+
+    // Shutdown channel for graceful shutdown
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
     // Spawn socket server
     let mut socket_handle = tokio::spawn(socket::run_socket_server(socket_req_tx));
@@ -133,8 +136,7 @@ pub async fn run_daemon(config: Config) -> Result<()> {
                                             let content_type = match &payload {
                                                 ClipboardPayload::Text(_) => ClipContentType::Text,
                                                 ClipboardPayload::Image { .. } => ClipContentType::Image,
-                                                ClipboardPayload::Files(_) => ClipContentType::Files,
-                                            };
+                                                                                            };
                                             let _ = stdb_cmd_tx.send(SpacetimeCommand::SyncClip {
                                                 device_id: device_id.clone(),
                                                 content_type,
@@ -163,8 +165,17 @@ pub async fn run_daemon(config: Config) -> Result<()> {
                     &age_identity,
                     &stdb_cmd_tx,
                     &clip_cmd_tx,
+                    &shutdown_tx,
                 ).await;
                 let _ = req.reply.send(response);
+            }
+
+            // Graceful shutdown signal
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    info!("Graceful shutdown initiated");
+                    break;
+                }
             }
 
             // Socket server failure
@@ -195,13 +206,13 @@ async fn handle_request(
     age_identity: &Option<age::x25519::Identity>,
     stdb_cmd_tx: &crossbeam_channel::Sender<SpacetimeCommand>,
     clip_cmd_tx: &std::sync::mpsc::Sender<ClipboardCommand>,
+    shutdown_tx: &watch::Sender<bool>,
 ) -> Response {
     match request {
         Request::Status => {
             // Look up username from SpacetimeDB
             let (reply_tx, reply_rx) = oneshot::channel();
             let _ = stdb_cmd_tx.send(SpacetimeCommand::GetUsername {
-                user_id,
                 reply: reply_tx,
             });
             let username = reply_rx.await.ok().flatten();
@@ -261,8 +272,7 @@ async fn handle_request(
                                 let content_type = match &payload {
                                     ClipboardPayload::Text(_) => ClipContentType::Text,
                                     ClipboardPayload::Image { .. } => ClipContentType::Image,
-                                    ClipboardPayload::Files(_) => ClipContentType::Files,
-                                };
+                                                                    };
                                 let _ = stdb_cmd_tx.send(SpacetimeCommand::SyncClip {
                                     device_id: device_id.to_string(),
                                     content_type,
@@ -296,7 +306,6 @@ async fn handle_request(
 
             let (reply_tx, reply_rx) = oneshot::channel();
             let _ = stdb_cmd_tx.send(SpacetimeCommand::GetCurrentClip {
-                user_id,
                 reply: reply_tx,
             });
 
@@ -310,19 +319,6 @@ async fn handle_request(
                                         ClipboardPayload::Text(text) => text.as_bytes().to_vec(),
                                         ClipboardPayload::Image { png_data, .. } => {
                                             png_data.clone()
-                                        }
-                                        ClipboardPayload::Files(_) => {
-                                            match payload.serialize() {
-                                                Ok(d) => d,
-                                                Err(e) => {
-                                                    return Response::Error {
-                                                        message: format!(
-                                                            "Failed to serialize files: {}",
-                                                            e
-                                                        ),
-                                                    }
-                                                }
-                                            }
                                         }
                                     };
                                     Response::ClipData {
@@ -356,7 +352,6 @@ async fn handle_request(
         Request::ListDevices => {
             let (reply_tx, reply_rx) = oneshot::channel();
             let _ = stdb_cmd_tx.send(SpacetimeCommand::ListDevices {
-                user_id,
                 reply: reply_tx,
             });
 
@@ -377,9 +372,32 @@ async fn handle_request(
             }
         }
 
+        Request::CreateInvite { code } => {
+            if !connected {
+                return Response::Error {
+                    message: "Not connected to SpacetimeDB".to_string(),
+                };
+            }
+
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let _ = stdb_cmd_tx.send(SpacetimeCommand::CreateInviteCode {
+                code: code.clone(),
+                reply: reply_tx,
+            });
+
+            match reply_rx.await {
+                Ok(Ok(())) => Response::InviteCreated { code },
+                Ok(Err(e)) => Response::Error { message: e },
+                Err(_) => Response::Error {
+                    message: "Failed to create invite code".to_string(),
+                },
+            }
+        }
+
         Request::Shutdown => {
             info!("Shutdown requested via socket");
-            std::process::exit(0);
+            let _ = shutdown_tx.send(true);
+            Response::Ok
         }
     }
 }

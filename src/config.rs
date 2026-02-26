@@ -2,6 +2,21 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+#[cfg(unix)]
+fn set_file_mode(path: &std::path::Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .with_context(|| format!("Failed to set permissions on {}", path.display()))
+}
+
+fn ensure_config_dir() -> Result<PathBuf> {
+    let dir = config_dir();
+    std::fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    set_file_mode(&dir, 0o700)?;
+    Ok(dir)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default = "default_watch_clipboard")]
@@ -56,10 +71,12 @@ impl Config {
 
     pub fn save(&self) -> Result<()> {
         let path = config_dir().join("config.toml");
-        std::fs::create_dir_all(path.parent().unwrap())?;
+        ensure_config_dir()?;
         let contents = toml::to_string_pretty(self)?;
         std::fs::write(&path, contents)
             .with_context(|| format!("Failed to write config to {}", path.display()))?;
+        #[cfg(unix)]
+        set_file_mode(&path, 0o600)?;
         Ok(())
     }
 }
@@ -93,8 +110,10 @@ pub fn load_device_id() -> Result<Option<String>> {
 
 pub fn save_device_id(id: &str) -> Result<()> {
     let path = device_id_path();
-    std::fs::create_dir_all(path.parent().unwrap())?;
+    ensure_config_dir()?;
     std::fs::write(&path, id).with_context(|| "Failed to write device_id")?;
+    #[cfg(unix)]
+    set_file_mode(&path, 0o600)?;
     Ok(())
 }
 
@@ -113,8 +132,10 @@ pub fn load_token() -> Result<Option<String>> {
 
 pub fn save_token(token: &str) -> Result<()> {
     let path = token_path();
-    std::fs::create_dir_all(path.parent().unwrap())?;
+    ensure_config_dir()?;
     std::fs::write(&path, token).with_context(|| "Failed to write token")?;
+    #[cfg(unix)]
+    set_file_mode(&path, 0o600)?;
     Ok(())
 }
 
@@ -140,8 +161,10 @@ pub fn load_user_id() -> Result<Option<u64>> {
 
 pub fn save_user_id(user_id: u64) -> Result<()> {
     let path = user_id_path();
-    std::fs::create_dir_all(path.parent().unwrap())?;
+    ensure_config_dir()?;
     std::fs::write(&path, user_id.to_string()).with_context(|| "Failed to write user_id")?;
+    #[cfg(unix)]
+    set_file_mode(&path, 0o600)?;
     Ok(())
 }
 

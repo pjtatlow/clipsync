@@ -1,5 +1,5 @@
 use anyhow::Result;
-use spacetimedb_sdk::{DbContext, Identity, Table, TableWithPrimaryKey};
+use spacetimedb_sdk::{DbContext, Identity, Table};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::module_bindings::*;
 
 // Import reducer extension traits
+use crate::module_bindings::create_invite_code_reducer::create_invite_code;
 use crate::module_bindings::register_device_reducer::register_device;
 use crate::module_bindings::sync_clip_reducer::sync_clip;
 
@@ -36,23 +37,23 @@ pub enum SpacetimeCommand {
         device_name: String,
     },
     ListDevices {
-        user_id: u64,
-        reply: oneshot::Sender<Vec<Device>>,
+        reply: oneshot::Sender<Vec<DeviceView>>,
     },
     GetCurrentClip {
-        user_id: u64,
         reply: oneshot::Sender<Option<CurrentClip>>,
     },
     GetUsername {
-        user_id: u64,
         reply: oneshot::Sender<Option<String>>,
+    },
+    CreateInviteCode {
+        code: String,
+        reply: oneshot::Sender<Result<(), String>>,
     },
 }
 
 pub fn spawn_spacetime_thread(
     config: &Config,
     token: Option<String>,
-    user_id: u64,
     event_tx: mpsc::Sender<SpacetimeEvent>,
     command_rx: crossbeam_channel::Receiver<SpacetimeCommand>,
 ) -> Result<()> {
@@ -79,10 +80,9 @@ pub fn spawn_spacetime_thread(
                         token: token.to_string(),
                     });
 
-                    // Subscribe to all tables
+                    // Subscribe to all tables (views are scoped to the current user)
                     let event_tx_for_sub = event_tx_sub.clone();
                     let event_tx_for_clip = event_tx_clip.clone();
-                    let uid = user_id;
 
                     conn.subscription_builder()
                         .on_applied(move |ctx: &SubscriptionEventContext| {
@@ -90,21 +90,12 @@ pub fn spawn_spacetime_thread(
                             let _ = event_tx_for_sub
                                 .blocking_send(SpacetimeEvent::SubscriptionApplied);
 
-                            // Register callbacks for clip updates
+                            // Register callback for clip updates via the my_current_clip view.
+                            // The view is scoped to the current user, so no UID check needed.
+                            // on_insert fires for both new clips and updates (view re-evaluates).
                             let tx = event_tx_for_clip.clone();
-                            let uid_for_update = uid;
-                            ctx.db.current_clip().on_update(move |_ctx: &EventContext, _old: &CurrentClip, new: &CurrentClip| {
-                                if new.user_id == uid_for_update {
-                                    let _ = tx.blocking_send(SpacetimeEvent::ClipUpdated(new.clone()));
-                                }
-                            });
-
-                            let tx2 = event_tx_for_clip.clone();
-                            let uid_for_insert = uid;
-                            ctx.db.current_clip().on_insert(move |_ctx: &EventContext, row: &CurrentClip| {
-                                if row.user_id == uid_for_insert {
-                                    let _ = tx2.blocking_send(SpacetimeEvent::ClipUpdated(row.clone()));
-                                }
+                            ctx.db.my_current_clip().on_insert(move |_ctx: &EventContext, row: &CurrentClip| {
+                                let _ = tx.blocking_send(SpacetimeEvent::ClipUpdated(row.clone()));
                             });
                         })
                         .subscribe_to_all_tables();
@@ -155,27 +146,30 @@ pub fn spawn_spacetime_thread(
                                 error!("Failed to call register_device: {}", e);
                             }
                         }
-                        SpacetimeCommand::ListDevices { user_id, reply } => {
-                            let devices: Vec<Device> = conn
-                                .db
-                                .device()
-                                .iter()
-                                .filter(|d| d.user_id == user_id)
-                                .collect();
+                        SpacetimeCommand::ListDevices { reply } => {
+                            let devices: Vec<DeviceView> =
+                                conn.db.my_devices().iter().collect();
                             let _ = reply.send(devices);
                         }
-                        SpacetimeCommand::GetCurrentClip { user_id, reply } => {
-                            let clip = conn.db.current_clip().user_id().find(&user_id);
+                        SpacetimeCommand::GetCurrentClip { reply } => {
+                            let clip = conn.db.my_current_clip().iter().next();
                             let _ = reply.send(clip);
                         }
-                        SpacetimeCommand::GetUsername { user_id, reply } => {
+                        SpacetimeCommand::GetUsername { reply } => {
                             let username = conn
                                 .db
-                                .user()
-                                .id()
-                                .find(&user_id)
-                                .map(|u| u.username.clone());
+                                .my_profile()
+                                .iter()
+                                .next()
+                                .map(|p| p.username.clone());
                             let _ = reply.send(username);
+                        }
+                        SpacetimeCommand::CreateInviteCode { code, reply } => {
+                            if let Err(e) = conn.reducers.create_invite_code(code) {
+                                let _ = reply.send(Err(format!("{}", e)));
+                            } else {
+                                let _ = reply.send(Ok(()));
+                            }
                         }
                     },
                     Err(_) => {

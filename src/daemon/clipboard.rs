@@ -85,10 +85,6 @@ pub fn spawn_clipboard_watcher(
                                         }
                                     }
                                 }
-                                ClipboardPayload::Files(_) => {
-                                    // Files can't be set to clipboard directly via arboard
-                                    warn!("File clipboard sync not supported for setting clipboard");
-                                }
                             }
                         }
                         ClipboardCommand::ReadClipboard { reply } => {
@@ -107,7 +103,6 @@ pub fn spawn_clipboard_watcher(
                             // But since we only have PNG here, we use it
                             hash_bytes(png_data)
                         }
-                        ClipboardPayload::Files(_) => 0, // Won't happen from arboard
                     };
 
                     let should_notify = match last_hash {

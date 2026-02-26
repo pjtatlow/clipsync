@@ -1,5 +1,4 @@
 use anyhow::{bail, Context, Result};
-use sha2::{Digest, Sha256};
 use spacetimedb_sdk::{DbContext, Identity, Table};
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,13 +7,11 @@ use crate::config::{self, Config};
 use crate::crypto;
 use crate::module_bindings::*;
 
-pub async fn run(username: String) -> Result<()> {
+pub async fn run(username: String, invite_code: Option<String>) -> Result<()> {
     let password = rpassword::prompt_password("Password: ")?;
     if password.is_empty() {
         bail!("Password cannot be empty");
     }
-
-    let password_hash = hash_password(&username, &password);
 
     // Generate a local keypair (used if this is a new account)
     let (local_identity, local_recipient) = crypto::generate_keypair();
@@ -52,11 +49,12 @@ pub async fn run(username: String) -> Result<()> {
     let existing_token = config::load_token()?;
 
     let un = username.clone();
-    let ph = password_hash.clone();
+    let pw = password.clone();
     let epk = encrypted_private_key.clone();
     let pk = public_key.clone();
     let did = device_id.clone();
     let dn = device_name.clone();
+    let ic = invite_code.unwrap_or_default();
 
     std::thread::Builder::new()
         .name("setup-stdb".to_string())
@@ -65,11 +63,12 @@ pub async fn run(username: String) -> Result<()> {
             let token_tx_connect = token_tx.clone();
 
             let un2 = un.clone();
-            let ph2 = ph.clone();
+            let pw2 = pw.clone();
             let epk2 = epk.clone();
             let pk2 = pk.clone();
             let did2 = did.clone();
             let dn2 = dn.clone();
+            let ic2 = ic.clone();
 
             let conn = DbConnection::builder()
                 .with_uri(&server_url)
@@ -80,59 +79,49 @@ pub async fn run(username: String) -> Result<()> {
 
                     let rtx = result_tx_sub.clone();
                     let un3 = un2.clone();
-                    let ph3 = ph2.clone();
+                    let pw3 = pw2.clone();
                     let epk3 = epk2.clone();
                     let pk3 = pk2.clone();
                     let did3 = did2.clone();
                     let dn3 = dn2.clone();
+                    let ic3 = ic2.clone();
 
                     conn.subscription_builder()
                         .on_applied(move |ctx: &SubscriptionEventContext| {
                             // Call authenticate reducer
                             if let Err(e) = ctx.reducers.authenticate(
                                 un3.clone(),
-                                ph3.clone(),
+                                pw3.clone(),
                                 epk3.clone(),
                                 pk3.clone(),
                                 did3.clone(),
                                 dn3.clone(),
+                                ic3.clone(),
                             ) {
                                 let _ = rtx.send(Err(format!("Failed to call authenticate: {}", e)));
                                 return;
                             }
 
-                            // Watch for user_identity insert to get our user_id
+                            // Watch for my_profile insert to get user info
+                            // (the user table is private; my_profile view exposes it securely)
                             let rtx2 = rtx.clone();
-                            ctx.db.user_identity().on_insert(
-                                move |ctx2: &EventContext, row: &UserIdentity| {
-                                    // Look up the user to get their encrypted_private_key
-                                    if let Some(user) = ctx2.db.user().id().find(&row.user_id) {
-                                        let _ = rtx2.send(Ok((
-                                            row.user_id,
-                                            user.encrypted_private_key.clone(),
-                                        )));
-                                    } else {
-                                        let _ = rtx2
-                                            .send(Err("User not found after auth".to_string()));
-                                    }
+                            ctx.db.my_profile().on_insert(
+                                move |_ctx2: &EventContext, profile: &UserProfile| {
+                                    let _ = rtx2.send(Ok((
+                                        profile.user_id,
+                                        profile.encrypted_private_key.clone(),
+                                    )));
                                 },
                             );
 
-                            // Also check if identity was already linked (login case where
-                            // user_identity row already exists and won't trigger on_insert)
+                            // Also check if profile already exists (login case where
+                            // user_identity row already exists and view is already populated)
                             let rtx3 = rtx.clone();
-                            if let Some(ui) = ctx
-                                .db
-                                .user_identity()
-                                .identity()
-                                .find(&ctx.identity())
-                            {
-                                if let Some(user) = ctx.db.user().id().find(&ui.user_id) {
-                                    let _ = rtx3.send(Ok((
-                                        ui.user_id,
-                                        user.encrypted_private_key.clone(),
-                                    )));
-                                }
+                            if let Some(profile) = ctx.db.my_profile().iter().next() {
+                                let _ = rtx3.send(Ok((
+                                    profile.user_id,
+                                    profile.encrypted_private_key.clone(),
+                                )));
                             }
                         })
                         .subscribe_to_all_tables();
@@ -202,10 +191,4 @@ pub async fn run(username: String) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn hash_password(username: &str, password: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(format!("{}:{}", username, password));
-    format!("{:x}", hasher.finalize())
 }

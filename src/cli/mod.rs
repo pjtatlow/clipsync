@@ -2,6 +2,7 @@ pub mod config;
 pub mod copy;
 pub mod devices;
 pub mod install;
+pub mod invite;
 pub mod paste;
 pub mod setup;
 pub mod status;
@@ -14,7 +15,7 @@ use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 use crate::config::socket_path;
-use crate::protocol::{Request, Response};
+use crate::protocol::{Request, Response, MAX_IPC_FRAME_SIZE};
 
 pub async fn send_request(request: Request) -> Result<Response> {
     let path = socket_path();
@@ -29,7 +30,10 @@ pub async fn send_request(request: Request) -> Result<Response> {
         .await
         .with_context(|| format!("Failed to connect to daemon at {}", path.display()))?;
 
-    let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
+    let codec = LengthDelimitedCodec::builder()
+        .max_frame_length(MAX_IPC_FRAME_SIZE)
+        .new_codec();
+    let mut framed = Framed::new(stream, codec);
 
     let request_bytes = serde_json::to_vec(&request)?;
     framed

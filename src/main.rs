@@ -23,6 +23,9 @@ enum Command {
     Setup {
         /// Username
         username: String,
+        /// Invite code (required for new accounts, not needed for first user or login)
+        #[arg(long)]
+        invite_code: Option<String>,
     },
     /// Sync clipboard content to SpacetimeDB
     Copy,
@@ -43,6 +46,8 @@ enum Command {
         /// Value to set (omit to read current value)
         value: Option<String>,
     },
+    /// Generate an invite code (admin only, daemon must be running)
+    Invite,
     /// Behave like xclip, backed by clipsync (for use as: alias xclip='clipsync xclip')
     #[command(trailing_var_arg = true, allow_hyphen_values = true)]
     Xclip {
@@ -71,12 +76,13 @@ async fn main() -> anyhow::Result<()> {
             let config = config::Config::load().unwrap_or_default();
             daemon::run_daemon(config).await?;
         }
-        Command::Setup { username } => cli::setup::run(username).await?,
+        Command::Setup { username, invite_code } => cli::setup::run(username, invite_code).await?,
         Command::Copy => cli::copy::run().await?,
         Command::Paste { r#type } => cli::paste::run(r#type).await?,
         Command::Status => cli::status::run().await?,
         Command::Devices => cli::devices::run().await?,
         Command::Config { key, value } => cli::config::run(key, value)?,
+        Command::Invite => cli::invite::run().await?,
         Command::Xclip { args } => cli::xclip::run(args).await?,
         Command::Install => cli::install::install().await?,
         Command::Uninstall => cli::install::uninstall().await?,

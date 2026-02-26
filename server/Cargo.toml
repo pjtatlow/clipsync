@@ -13,3 +13,5 @@ crate-type = ["cdylib"]
 [dependencies]
 spacetimedb = "2.0"
 log = "0.4"
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+password-hash = { version = "0.5", default-features = false }

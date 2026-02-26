@@ -42,7 +42,6 @@ spacetimedb-sdk = "2.0"
 openssl = { version = "0.10", features = ["vendored"], optional = true }
 gethostname = "0.5"
 rpassword = "7"
-sha2 = "0.10"
 
 # The profile that 'dist' will build with
 [profile.dist]
