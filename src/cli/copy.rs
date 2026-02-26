@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use std::io::{IsTerminal, Read};
 
 use crate::protocol::{Request, Response};
@@ -21,12 +21,10 @@ pub async fn run() -> Result<()> {
             eprintln!("Clipboard synced");
         }
         Response::Error { message } => {
-            eprintln!("Error: {}", message);
-            std::process::exit(1);
+            bail!("{}", message);
         }
         _ => {
-            eprintln!("Unexpected response");
-            std::process::exit(1);
+            bail!("Unexpected response");
         }
     }
 

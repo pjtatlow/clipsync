@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 
 use crate::protocol::{Request, Response};
 
@@ -24,12 +24,10 @@ pub async fn run() -> Result<()> {
             println!("Watching:  {}", watching);
         }
         Response::Error { message } => {
-            eprintln!("Error: {}", message);
-            std::process::exit(1);
+            bail!("{}", message);
         }
         _ => {
-            eprintln!("Unexpected response");
-            std::process::exit(1);
+            bail!("Unexpected response");
         }
     }
 

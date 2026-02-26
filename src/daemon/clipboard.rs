@@ -55,7 +55,7 @@ pub fn spawn_clipboard_watcher(
                             match &payload {
                                 ClipboardPayload::Text(text) => {
                                     let h = hash_bytes(text.as_bytes());
-                                    *last_written_hash_for_cmd.lock().unwrap() = Some(h);
+                                    *last_written_hash_for_cmd.lock().unwrap_or_else(|e| e.into_inner()) = Some(h);
                                     last_hash = Some(h);
                                     if let Err(e) = clipboard.set_text(text) {
                                         error!("Failed to set clipboard text: {}", e);
@@ -67,8 +67,8 @@ pub fn spawn_clipboard_watcher(
                                 } => {
                                     match payload::png_to_rgba(png_data) {
                                         Ok((w, h, rgba)) => {
-                                            let hash = hash_bytes(&rgba);
-                                            *last_written_hash_for_cmd.lock().unwrap() =
+                                            let hash = hash_bytes(png_data);
+                                            *last_written_hash_for_cmd.lock().unwrap_or_else(|e| e.into_inner()) =
                                                 Some(hash);
                                             last_hash = Some(hash);
                                             let img_data = arboard::ImageData {
@@ -113,7 +113,7 @@ pub fn spawn_clipboard_watcher(
                     if should_notify {
                         // Check if this is content we just wrote
                         let was_written = {
-                            let guard = last_written_hash.lock().unwrap();
+                            let guard = last_written_hash.lock().unwrap_or_else(|e| e.into_inner());
                             guard.as_ref() == Some(&current_hash)
                         };
 
@@ -129,7 +129,7 @@ pub fn spawn_clipboard_watcher(
                             }
                         } else {
                             // Clear the written hash now that we've seen it
-                            *last_written_hash.lock().unwrap() = None;
+                            *last_written_hash.lock().unwrap_or_else(|e| e.into_inner()) = None;
                         }
 
                         last_hash = Some(current_hash);

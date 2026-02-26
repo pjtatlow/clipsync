@@ -25,7 +25,6 @@ age = "0.11"
 zstd = "0.13"
 image = { version = "0.25", default-features = false, features = ["png"] }
 anyhow = "1"
-thiserror = "2"
 dirs = "6"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
@@ -38,6 +37,7 @@ bytes = "1"
 futures = "0.3"
 service-manager = "0.7"
 libc = "0.2"
+nix = { version = "0.29", default-features = false, features = ["user"] }
 spacetimedb-sdk = "2.0"
 openssl = { version = "0.10", features = ["vendored"], optional = true }
 gethostname = "0.5"

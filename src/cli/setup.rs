@@ -60,6 +60,7 @@ pub async fn run(username: String, invite_code: Option<String>) -> Result<()> {
         .name("setup-stdb".to_string())
         .spawn(move || {
             let result_tx_sub = result_tx.clone();
+            let result_tx_build = result_tx.clone();
             let token_tx_connect = token_tx.clone();
 
             let un2 = un.clone();
@@ -78,25 +79,18 @@ pub async fn run(username: String, invite_code: Option<String>) -> Result<()> {
                     let _ = token_tx_connect.send(token.to_string());
 
                     let rtx = result_tx_sub.clone();
-                    let un3 = un2.clone();
-                    let pw3 = pw2.clone();
-                    let epk3 = epk2.clone();
-                    let pk3 = pk2.clone();
-                    let did3 = did2.clone();
-                    let dn3 = dn2.clone();
-                    let ic3 = ic2.clone();
 
                     conn.subscription_builder()
                         .on_applied(move |ctx: &SubscriptionEventContext| {
                             // Call authenticate reducer
                             if let Err(e) = ctx.reducers.authenticate(
-                                un3.clone(),
-                                pw3.clone(),
-                                epk3.clone(),
-                                pk3.clone(),
-                                did3.clone(),
-                                dn3.clone(),
-                                ic3.clone(),
+                                un2,
+                                pw2,
+                                epk2,
+                                pk2,
+                                did2,
+                                dn2,
+                                ic2,
                             ) {
                                 let _ = rtx.send(Err(format!("Failed to call authenticate: {}", e)));
                                 return;
@@ -116,9 +110,8 @@ pub async fn run(username: String, invite_code: Option<String>) -> Result<()> {
 
                             // Also check if profile already exists (login case where
                             // user_identity row already exists and view is already populated)
-                            let rtx3 = rtx.clone();
                             if let Some(profile) = ctx.db.my_profile().iter().next() {
-                                let _ = rtx3.send(Ok((
+                                let _ = rtx.send(Ok((
                                     profile.user_id,
                                     profile.encrypted_private_key.clone(),
                                 )));
@@ -131,10 +124,15 @@ pub async fn run(username: String, invite_code: Option<String>) -> Result<()> {
                         let _ = result_tx.send(Err(format!("Disconnected: {:?}", e)));
                     }
                 })
-                .build()
-                .expect("Failed to connect to SpacetimeDB");
+                .build();
 
-            let conn = Arc::new(conn);
+            let conn = match conn {
+                Ok(conn) => Arc::new(conn),
+                Err(e) => {
+                    let _ = result_tx_build.send(Err(format!("Failed to connect to SpacetimeDB: {}", e)));
+                    return;
+                }
+            };
             let _handle = conn.run_threaded();
 
             std::thread::sleep(Duration::from_secs(60));
@@ -143,12 +141,12 @@ pub async fn run(username: String, invite_code: Option<String>) -> Result<()> {
     // Wait for token
     let token = token_rx
         .recv_timeout(Duration::from_secs(30))
-        .with_context(|| "Timed out waiting for SpacetimeDB connection")?;
+        .context("Timed out waiting for SpacetimeDB connection")?;
 
     // Wait for auth result
     let result = result_rx
         .recv_timeout(Duration::from_secs(30))
-        .with_context(|| "Timed out waiting for authentication result")?;
+        .context("Timed out waiting for authentication result")?;
 
     match result {
         Ok((user_id, server_encrypted_pk)) => {
@@ -157,10 +155,10 @@ pub async fn run(username: String, invite_code: Option<String>) -> Result<()> {
             // For existing accounts, this is the original key.
             let private_key_bytes =
                 crypto::decrypt_with_passphrase(&server_encrypted_pk, &password)
-                    .with_context(|| "Failed to decrypt private key (wrong password?)")?;
+                    .context("Failed to decrypt private key (wrong password?)")?;
 
             let private_key_str =
-                std::str::from_utf8(&private_key_bytes).with_context(|| "Invalid private key")?;
+                std::str::from_utf8(&private_key_bytes).context("Invalid private key")?;
 
             let age_identity: age::x25519::Identity = private_key_str
                 .trim()

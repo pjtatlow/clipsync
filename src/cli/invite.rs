@@ -5,10 +5,7 @@ use crate::protocol::{Request, Response};
 pub async fn run() -> Result<()> {
     let code = uuid::Uuid::new_v4().to_string();
 
-    let response = super::send_request(Request::CreateInvite {
-        code: code.clone(),
-    })
-    .await?;
+    let response = super::send_request(Request::CreateInvite { code }).await?;
 
     match response {
         Response::InviteCreated { code } => {

@@ -68,7 +68,7 @@ pub fn spawn_spacetime_thread(
             let event_tx_sub = event_tx.clone();
             let event_tx_clip = event_tx.clone();
 
-            let conn: DbConnection = DbConnection::builder()
+            let conn = DbConnection::builder()
                 .with_uri(&server_url)
                 .with_database_name(&database_name)
                 .with_token(token)
@@ -108,8 +108,15 @@ pub fn spawn_spacetime_thread(
                     }
                     let _ = event_tx_disconnect.blocking_send(SpacetimeEvent::Disconnected);
                 })
-                .build()
-                .expect("Failed to connect to SpacetimeDB");
+                .build();
+
+            let conn = match conn {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("Failed to connect to SpacetimeDB: {}", e);
+                    return;
+                }
+            };
 
             let conn = Arc::new(conn);
 

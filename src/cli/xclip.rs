@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use std::io::Write;
 
 use crate::protocol::{Request, Response};
@@ -12,11 +12,11 @@ pub async fn run(args: Vec<String>) -> Result<()> {
     while i < args.len() {
         match args[i].as_str() {
             "-selection" => {
-                selection = args.get(i + 1).map(|s| s.as_str().to_string());
+                selection = args.get(i + 1).cloned();
                 i += 2;
             }
             "-t" => {
-                target = args.get(i + 1).map(|s| s.as_str().to_string());
+                target = args.get(i + 1).cloned();
                 i += 2;
             }
             "-o" => {
@@ -38,7 +38,7 @@ pub async fn run(args: Vec<String>) -> Result<()> {
 
     let clip_type = match &response {
         Response::ClipData { content_type, .. } => content_type.clone(),
-        _ => std::process::exit(1),
+        _ => bail!("Unexpected response from daemon"),
     };
 
     // TARGETS query
@@ -46,7 +46,7 @@ pub async fn run(args: Vec<String>) -> Result<()> {
         match clip_type.as_str() {
             "image" => println!("image/png"),
             "text" => println!("text/plain"),
-            _ => std::process::exit(1),
+            _ => bail!("Unknown clip type: {}", clip_type),
         }
         return Ok(());
     }
@@ -60,7 +60,7 @@ pub async fn run(args: Vec<String>) -> Result<()> {
                     return Ok(());
                 }
             }
-            std::process::exit(1);
+            bail!("No image data available");
         }
     }
 
@@ -72,8 +72,8 @@ pub async fn run(args: Vec<String>) -> Result<()> {
                 return Ok(());
             }
         }
-        std::process::exit(1);
+        bail!("No text data available");
     }
 
-    std::process::exit(1);
+    bail!("Unsupported target: {}", target.unwrap_or_default());
 }

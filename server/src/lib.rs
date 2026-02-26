@@ -104,6 +104,9 @@ const MAX_FAILED_ATTEMPTS: u32 = 5;
 const LOCKOUT_DURATION_MICROS: i64 = 15 * 60 * 1_000_000; // 15 minutes
 const ATTEMPT_WINDOW_MICROS: i64 = 15 * 60 * 1_000_000; // 15 minutes
 const INVITE_CODE_TTL_MICROS: i64 = 24 * 60 * 60 * 1_000_000; // 24 hours
+const MIN_PASSWORD_LENGTH: usize = 8;
+const MIN_INVITE_CODE_LENGTH: usize = 32;
+const MIN_INVITE_CODE_UNIQUE_CHARS: usize = 16;
 
 // --- Lifecycle Reducers ---
 
@@ -134,8 +137,8 @@ fn get_user_id(ctx: &ReducerContext) -> Result<u64, String> {
 }
 
 fn upsert_device(ctx: &ReducerContext, user_id: u64, device_id: &str, device_name: &str) {
-    for existing in ctx.db.device().iter() {
-        if existing.user_id == user_id && existing.device_id == device_id {
+    for existing in ctx.db.device().user_id().filter(&user_id) {
+        if existing.device_id == device_id {
             ctx.db.device().id().update(Device {
                 device_name: device_name.to_string(),
                 registered_at: ctx.timestamp,
@@ -187,13 +190,13 @@ fn verify_password_argon2(password: &str, hash_str: &str) -> Result<(), String> 
 
 /// Record a failed login attempt and return an error.
 /// Implements brute force protection with account lockout.
-fn record_failed_login(ctx: &ReducerContext, username: &str) -> String {
+fn record_failed_login(ctx: &ReducerContext, username: &String) -> String {
     let now = ctx.timestamp;
     let lockout_until = Timestamp::from_micros_since_unix_epoch(
         now.to_micros_since_unix_epoch() + LOCKOUT_DURATION_MICROS,
     );
 
-    if let Some(existing) = ctx.db.failed_login().username().find(&username.to_string()) {
+    if let Some(existing) = ctx.db.failed_login().username().find(username) {
         let new_count = existing.attempt_count + 1;
         let locked_until = if new_count >= MAX_FAILED_ATTEMPTS {
             lockout_until
@@ -207,7 +210,7 @@ fn record_failed_login(ctx: &ReducerContext, username: &str) -> String {
         });
     } else {
         ctx.db.failed_login().insert(FailedLogin {
-            username: username.to_string(),
+            username: username.clone(),
             attempt_count: 1,
             first_attempt_at: now,
             locked_until: Timestamp::UNIX_EPOCH,
@@ -218,18 +221,18 @@ fn record_failed_login(ctx: &ReducerContext, username: &str) -> String {
 }
 
 /// Clear failed login attempts on successful authentication.
-fn clear_failed_logins(ctx: &ReducerContext, username: &str) {
+fn clear_failed_logins(ctx: &ReducerContext, username: &String) {
     ctx.db
         .failed_login()
         .username()
-        .delete(&username.to_string());
+        .delete(username);
 }
 
 /// Check if the account is locked due to too many failed attempts.
 /// Also resets the counter if the attempt window has expired.
-fn check_brute_force_lockout(ctx: &ReducerContext, username: &str) -> Result<(), String> {
+fn check_brute_force_lockout(ctx: &ReducerContext, username: &String) -> Result<(), String> {
     let now = ctx.timestamp;
-    if let Some(record) = ctx.db.failed_login().username().find(&username.to_string()) {
+    if let Some(record) = ctx.db.failed_login().username().find(username) {
         // Check if currently locked out
         if record.locked_until > now {
             return Err("Authentication failed".to_string());
@@ -244,7 +247,7 @@ fn check_brute_force_lockout(ctx: &ReducerContext, username: &str) -> Result<(),
             ctx.db
                 .failed_login()
                 .username()
-                .delete(&username.to_string());
+                .delete(username);
         }
     }
     Ok(())
@@ -272,7 +275,7 @@ pub fn authenticate(
     if username.is_empty() {
         return Err("Username cannot be empty".to_string());
     }
-    if password.len() < 8 {
+    if password.len() < MIN_PASSWORD_LENGTH {
         return Err("Authentication failed".to_string());
     }
     if device_id.is_empty() {
@@ -280,7 +283,7 @@ pub fn authenticate(
     }
 
     // Check if username already exists
-    let user = ctx.db.user().iter().find(|u| u.username == username);
+    let user = ctx.db.user().username().find(&username);
 
     let user_id = if let Some(existing_user) = user {
         // Login: check brute force lockout before attempting password verification
@@ -299,7 +302,7 @@ pub fn authenticate(
         // Signup: check brute force lockout (prevents invite code guessing)
         check_brute_force_lockout(ctx, &username)?;
 
-        let is_first_user = ctx.db.user().iter().count() == 0;
+        let is_first_user = ctx.db.user().iter().next().is_none();
 
         if !is_first_user {
             // Require and validate invite code
@@ -375,12 +378,12 @@ pub fn create_invite_code(ctx: &ReducerContext, code: String) -> Result<(), Stri
         return Err("Invite code cannot be empty".to_string());
     }
 
-    if code.len() < 32 {
+    if code.len() < MIN_INVITE_CODE_LENGTH {
         return Err("Invite code must be at least 32 characters".to_string());
     }
 
     let unique_chars = code.chars().collect::<std::collections::HashSet<_>>().len();
-    if unique_chars < 16 {
+    if unique_chars < MIN_INVITE_CODE_UNIQUE_CHARS {
         return Err("Invite code has insufficient entropy".to_string());
     }
 
@@ -401,7 +404,7 @@ pub fn create_invite_code(ctx: &ReducerContext, code: String) -> Result<(), Stri
     }
 
     ctx.db.invite_code().insert(InviteCode {
-        code: code.clone(),
+        code,
         created_by: user_id,
         created_at: ctx.timestamp,
         expires_at: Timestamp::from_micros_since_unix_epoch(
@@ -432,8 +435,8 @@ pub fn register_device(
 pub fn unregister_device(ctx: &ReducerContext, device_id: String) -> Result<(), String> {
     let user_id = get_user_id(ctx)?;
 
-    for existing in ctx.db.device().iter() {
-        if existing.user_id == user_id && existing.device_id == device_id {
+    for existing in ctx.db.device().user_id().filter(&user_id) {
+        if existing.device_id == device_id {
             ctx.db.device().id().delete(&existing.id);
             log::info!("Device unregistered: {} for user {}", device_id, user_id);
             return Ok(());

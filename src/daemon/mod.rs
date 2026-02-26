@@ -126,29 +126,13 @@ pub async fn run_daemon(config: Config) -> Result<()> {
                             continue;
                         }
 
-                        if let Some(age_id) = &age_identity {
-                            let recipient = age_id.to_public();
-                            match payload.serialize() {
-                                Ok(data) => {
-                                    let size_bytes = data.len() as u64;
-                                    match crypto::encrypt(&data, vec![recipient]) {
-                                        Ok(encrypted) => {
-                                            let content_type = match &payload {
-                                                ClipboardPayload::Text(_) => ClipContentType::Text,
-                                                ClipboardPayload::Image { .. } => ClipContentType::Image,
-                                                                                            };
-                                            let _ = stdb_cmd_tx.send(SpacetimeCommand::SyncClip {
-                                                device_id: device_id.clone(),
-                                                content_type,
-                                                encrypted_data: encrypted,
-                                                size_bytes,
-                                            });
-                                        }
-                                        Err(e) => error!("Failed to encrypt clip: {}", e),
-                                    }
-                                }
-                                Err(e) => error!("Failed to serialize clip: {}", e),
-                            }
+                        if let Err(e) = encrypt_and_sync(
+                            &payload,
+                            &device_id,
+                            age_identity.as_ref(),
+                            &stdb_cmd_tx,
+                        ) {
+                            error!("Failed to sync clipboard: {}", e);
                         }
                     }
                 }
@@ -162,7 +146,7 @@ pub async fn run_daemon(config: Config) -> Result<()> {
                     user_id,
                     &device_id,
                     watching,
-                    &age_identity,
+                    age_identity.as_ref(),
                     &stdb_cmd_tx,
                     &clip_cmd_tx,
                     &shutdown_tx,
@@ -203,7 +187,7 @@ async fn handle_request(
     user_id: u64,
     device_id: &str,
     watching: bool,
-    age_identity: &Option<age::x25519::Identity>,
+    age_identity: Option<&age::x25519::Identity>,
     stdb_cmd_tx: &crossbeam_channel::Sender<SpacetimeCommand>,
     clip_cmd_tx: &std::sync::mpsc::Sender<ClipboardCommand>,
     shutdown_tx: &watch::Sender<bool>,
@@ -229,7 +213,7 @@ async fn handle_request(
         Request::Copy { data } => {
             let payload = if let Some(data) = data {
                 // Data provided (from stdin)
-                ClipboardPayload::Text(String::from_utf8_lossy(&data).to_string())
+                ClipboardPayload::Text(String::from_utf8_lossy(&data).into_owned())
             } else {
                 // Read from system clipboard
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -262,38 +246,9 @@ async fn handle_request(
                 };
             }
 
-            if let Some(age_id) = age_identity {
-                let recipient = age_id.to_public();
-                match payload.serialize() {
-                    Ok(data) => {
-                        let size_bytes = data.len() as u64;
-                        match crypto::encrypt(&data, vec![recipient]) {
-                            Ok(encrypted) => {
-                                let content_type = match &payload {
-                                    ClipboardPayload::Text(_) => ClipContentType::Text,
-                                    ClipboardPayload::Image { .. } => ClipContentType::Image,
-                                                                    };
-                                let _ = stdb_cmd_tx.send(SpacetimeCommand::SyncClip {
-                                    device_id: device_id.to_string(),
-                                    content_type,
-                                    encrypted_data: encrypted,
-                                    size_bytes,
-                                });
-                                Response::Ok
-                            }
-                            Err(e) => Response::Error {
-                                message: format!("Encryption failed: {}", e),
-                            },
-                        }
-                    }
-                    Err(e) => Response::Error {
-                        message: format!("Serialization failed: {}", e),
-                    },
-                }
-            } else {
-                Response::Error {
-                    message: "No encryption key configured. Run `clipsync setup`.".to_string(),
-                }
+            match encrypt_and_sync(&payload, device_id, age_identity, stdb_cmd_tx) {
+                Ok(()) => Response::Ok,
+                Err(e) => Response::Error { message: e },
             }
         }
 
@@ -402,8 +357,32 @@ async fn handle_request(
     }
 }
 
+fn encrypt_and_sync(
+    payload: &ClipboardPayload,
+    device_id: &str,
+    age_identity: Option<&age::x25519::Identity>,
+    stdb_cmd_tx: &crossbeam_channel::Sender<SpacetimeCommand>,
+) -> Result<(), String> {
+    let age_id = age_identity.ok_or("No encryption key configured. Run `clipsync setup`.")?;
+    let recipient = age_id.to_public();
+    let data = payload.serialize().map_err(|e| format!("Serialization failed: {}", e))?;
+    let size_bytes = data.len() as u64;
+    let encrypted = crypto::encrypt(&data, &[recipient]).map_err(|e| format!("Encryption failed: {}", e))?;
+    let content_type = match payload {
+        ClipboardPayload::Text(_) => ClipContentType::Text,
+        ClipboardPayload::Image { .. } => ClipContentType::Image,
+    };
+    let _ = stdb_cmd_tx.send(SpacetimeCommand::SyncClip {
+        device_id: device_id.to_string(),
+        content_type,
+        encrypted_data: encrypted,
+        size_bytes,
+    });
+    Ok(())
+}
+
 fn hostname() -> String {
     gethostname::gethostname()
         .to_string_lossy()
-        .to_string()
+        .into_owned()
 }

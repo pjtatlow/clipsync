@@ -1,8 +1,9 @@
+use age::secrecy::ExposeSecret;
 use age::x25519;
 use anyhow::{Context, Result};
 use std::io::{Read, Write};
 
-use crate::config::config_dir;
+use crate::config;
 
 pub fn generate_keypair() -> (x25519::Identity, x25519::Recipient) {
     let identity = x25519::Identity::generate();
@@ -10,15 +11,15 @@ pub fn generate_keypair() -> (x25519::Identity, x25519::Recipient) {
     (identity, recipient)
 }
 
-pub fn identity_file_path() -> std::path::PathBuf {
-    config_dir().join("identity.age")
+pub fn identity_file_path() -> Result<std::path::PathBuf> {
+    Ok(config::config_dir()?.join("identity.age"))
 }
 
 pub fn store_private_key(identity: &x25519::Identity) -> Result<()> {
     let key_str = identity.to_string().expose_secret().to_string();
 
-    let path = identity_file_path();
-    std::fs::create_dir_all(path.parent().unwrap())?;
+    config::ensure_config_dir()?;
+    let path = identity_file_path()?;
     std::fs::write(&path, &key_str).with_context(|| "Failed to write identity file")?;
 
     #[cfg(unix)]
@@ -31,7 +32,7 @@ pub fn store_private_key(identity: &x25519::Identity) -> Result<()> {
 }
 
 pub fn load_private_key() -> Result<x25519::Identity> {
-    let path = identity_file_path();
+    let path = identity_file_path()?;
     let key_str =
         std::fs::read_to_string(&path).with_context(|| "Failed to read identity file")?;
     let identity: x25519::Identity = key_str
@@ -79,7 +80,7 @@ pub fn decrypt_with_passphrase(encrypted: &[u8], passphrase: &str) -> Result<Vec
     Ok(decrypted)
 }
 
-pub fn encrypt(data: &[u8], recipients: Vec<x25519::Recipient>) -> Result<Vec<u8>> {
+pub fn encrypt(data: &[u8], recipients: &[x25519::Recipient]) -> Result<Vec<u8>> {
     // Compress with zstd first
     let compressed = zstd::encode_all(data, 3).with_context(|| "zstd compression failed")?;
 
@@ -125,9 +126,6 @@ pub fn decrypt(encrypted: &[u8], identity: &x25519::Identity) -> Result<Vec<u8>>
     Ok(decompressed)
 }
 
-// Re-export for convenience
-use age::secrecy::ExposeSecret;
-
 pub fn public_key_bytes(recipient: &x25519::Recipient) -> Vec<u8> {
     // age X25519 recipient string is "age1..." bech32. We store the raw string bytes for now.
     // The plan says 32 bytes but age's Recipient doesn't expose raw bytes directly.
@@ -144,7 +142,7 @@ mod tests {
         let (identity, recipient) = generate_keypair();
         let plaintext = b"hello world, this is a test of E2E encryption";
 
-        let encrypted = encrypt(plaintext, vec![recipient]).unwrap();
+        let encrypted = encrypt(plaintext, &[recipient]).unwrap();
         assert_ne!(encrypted, plaintext);
 
         let decrypted = decrypt(&encrypted, &identity).unwrap();
@@ -156,7 +154,7 @@ mod tests {
         let (identity, recipient) = generate_keypair();
         let plaintext: Vec<u8> = (0..100_000).map(|i| (i % 256) as u8).collect();
 
-        let encrypted = encrypt(&plaintext, vec![recipient]).unwrap();
+        let encrypted = encrypt(&plaintext, &[recipient]).unwrap();
         let decrypted = decrypt(&encrypted, &identity).unwrap();
         assert_eq!(decrypted, plaintext);
     }

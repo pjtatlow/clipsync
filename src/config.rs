@@ -9,8 +9,8 @@ fn set_file_mode(path: &std::path::Path, mode: u32) -> Result<()> {
         .with_context(|| format!("Failed to set permissions on {}", path.display()))
 }
 
-fn ensure_config_dir() -> Result<PathBuf> {
-    let dir = config_dir();
+pub fn ensure_config_dir() -> Result<PathBuf> {
+    let dir = config_dir()?;
     std::fs::create_dir_all(&dir)?;
     #[cfg(unix)]
     set_file_mode(&dir, 0o700)?;
@@ -58,7 +58,7 @@ impl Default for Config {
 
 impl Config {
     pub fn load() -> Result<Self> {
-        let path = config_dir().join("config.toml");
+        let path = config_dir()?.join("config.toml");
         if path.exists() {
             let contents = std::fs::read_to_string(&path)
                 .with_context(|| format!("Failed to read config from {}", path.display()))?;
@@ -70,7 +70,7 @@ impl Config {
     }
 
     pub fn save(&self) -> Result<()> {
-        let path = config_dir().join("config.toml");
+        let path = config_dir()?.join("config.toml");
         ensure_config_dir()?;
         let contents = toml::to_string_pretty(self)?;
         std::fs::write(&path, contents)
@@ -81,22 +81,22 @@ impl Config {
     }
 }
 
-pub fn config_dir() -> PathBuf {
-    dirs::config_dir()
-        .expect("Could not determine config directory")
-        .join("clipsync")
+pub fn config_dir() -> Result<PathBuf> {
+    Ok(dirs::config_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine config directory"))?
+        .join("clipsync"))
 }
 
-pub fn device_id_path() -> PathBuf {
-    config_dir().join("device_id")
+fn device_id_path() -> Result<PathBuf> {
+    Ok(config_dir()?.join("device_id"))
 }
 
-pub fn token_path() -> PathBuf {
-    config_dir().join("token")
+fn token_path() -> Result<PathBuf> {
+    Ok(config_dir()?.join("token"))
 }
 
 pub fn load_device_id() -> Result<Option<String>> {
-    let path = device_id_path();
+    let path = device_id_path()?;
     if path.exists() {
         let id = std::fs::read_to_string(&path)
             .with_context(|| "Failed to read device_id")?
@@ -109,7 +109,7 @@ pub fn load_device_id() -> Result<Option<String>> {
 }
 
 pub fn save_device_id(id: &str) -> Result<()> {
-    let path = device_id_path();
+    let path = device_id_path()?;
     ensure_config_dir()?;
     std::fs::write(&path, id).with_context(|| "Failed to write device_id")?;
     #[cfg(unix)]
@@ -118,7 +118,7 @@ pub fn save_device_id(id: &str) -> Result<()> {
 }
 
 pub fn load_token() -> Result<Option<String>> {
-    let path = token_path();
+    let path = token_path()?;
     if path.exists() {
         let token = std::fs::read_to_string(&path)
             .with_context(|| "Failed to read token")?
@@ -131,7 +131,7 @@ pub fn load_token() -> Result<Option<String>> {
 }
 
 pub fn save_token(token: &str) -> Result<()> {
-    let path = token_path();
+    let path = token_path()?;
     ensure_config_dir()?;
     std::fs::write(&path, token).with_context(|| "Failed to write token")?;
     #[cfg(unix)]
@@ -139,20 +139,16 @@ pub fn save_token(token: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn user_id_path() -> PathBuf {
-    config_dir().join("user_id")
+fn user_id_path() -> Result<PathBuf> {
+    Ok(config_dir()?.join("user_id"))
 }
 
 pub fn load_user_id() -> Result<Option<u64>> {
-    let path = user_id_path();
+    let path = user_id_path()?;
     if path.exists() {
-        let id_str = std::fs::read_to_string(&path)
-            .with_context(|| "Failed to read user_id")?
-            .trim()
-            .to_string();
-        let id: u64 = id_str
-            .parse()
-            .with_context(|| "Failed to parse user_id")?;
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| "Failed to read user_id")?;
+        let id: u64 = content.trim().parse().context("Failed to parse user_id")?;
         Ok(Some(id))
     } else {
         Ok(None)
@@ -160,7 +156,7 @@ pub fn load_user_id() -> Result<Option<u64>> {
 }
 
 pub fn save_user_id(user_id: u64) -> Result<()> {
-    let path = user_id_path();
+    let path = user_id_path()?;
     ensure_config_dir()?;
     std::fs::write(&path, user_id.to_string()).with_context(|| "Failed to write user_id")?;
     #[cfg(unix)]
@@ -175,7 +171,7 @@ pub fn socket_path() -> PathBuf {
     if let Ok(tmpdir) = std::env::var("TMPDIR") {
         return PathBuf::from(tmpdir).join("clipsync.sock");
     }
-    let uid = unsafe { libc::getuid() };
+    let uid = nix::unistd::getuid().as_raw();
     PathBuf::from(format!("/tmp/clipsync-{}.sock", uid))
 }
 

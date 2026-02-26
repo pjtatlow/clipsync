@@ -12,10 +12,10 @@ fn service_label() -> Result<ServiceLabel> {
 
 pub async fn install() -> Result<()> {
     let mut manager = <dyn ServiceManager>::native()
-        .with_context(|| "Failed to get native service manager")?;
+        .context("Failed to get native service manager")?;
     manager
         .set_level(ServiceLevel::User)
-        .with_context(|| "Failed to set service level to user")?;
+        .context("Failed to set service level to user")?;
 
     let exe = std::env::current_exe()?;
 
@@ -32,13 +32,13 @@ pub async fn install() -> Result<()> {
 
     manager
         .install(install_ctx)
-        .with_context(|| "Failed to install service")?;
+        .context("Failed to install service")?;
 
     manager
         .start(ServiceStartCtx {
             label: service_label()?,
         })
-        .with_context(|| "Failed to start service")?;
+        .context("Failed to start service")?;
 
     println!("Service installed and started.");
     println!("The daemon will start automatically on login.");
@@ -48,10 +48,10 @@ pub async fn install() -> Result<()> {
 
 pub async fn uninstall() -> Result<()> {
     let mut manager = <dyn ServiceManager>::native()
-        .with_context(|| "Failed to get native service manager")?;
+        .context("Failed to get native service manager")?;
     manager
         .set_level(ServiceLevel::User)
-        .with_context(|| "Failed to set service level to user")?;
+        .context("Failed to set service level to user")?;
 
     // Try to stop first, ignore errors if not running
     let _ = manager.stop(ServiceStopCtx {
@@ -62,7 +62,7 @@ pub async fn uninstall() -> Result<()> {
         .uninstall(ServiceUninstallCtx {
             label: service_label()?,
         })
-        .with_context(|| "Failed to uninstall service")?;
+        .context("Failed to uninstall service")?;
 
     println!("Service uninstalled.");
 

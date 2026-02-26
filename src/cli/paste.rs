@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use std::io::{IsTerminal, Write};
 
 use crate::protocol::{Request, Response};
@@ -27,18 +27,15 @@ pub async fn run(type_only: bool) -> Result<()> {
                     }
                 }
                 _ => {
-                    eprintln!("Unknown content type: {}", content_type);
-                    std::process::exit(1);
+                    bail!("Unknown content type: {}", content_type);
                 }
             }
         }
         Response::Error { message } => {
-            eprintln!("Error: {}", message);
-            std::process::exit(1);
+            bail!("{}", message);
         }
         _ => {
-            eprintln!("Unexpected response");
-            std::process::exit(1);
+            bail!("Unexpected response");
         }
     }
 

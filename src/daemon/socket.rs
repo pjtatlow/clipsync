@@ -7,7 +7,7 @@ use futures::SinkExt;
 use tokio::net::UnixListener;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::socket_path;
 use crate::protocol::{Request, Response, MAX_IPC_FRAME_SIZE};
@@ -101,7 +101,7 @@ pub async fn run_socket_server(request_tx: mpsc::Sender<SocketRequest>) -> Resul
             {
                 match stream.peer_cred() {
                     Ok(cred) => {
-                        let our_uid = unsafe { libc::getuid() };
+                        let our_uid = nix::unistd::getuid().as_raw();
                         if cred.uid() != our_uid {
                             warn!(
                                 "Rejected connection from different UID (peer={}, ours={})",
@@ -143,7 +143,13 @@ pub async fn run_socket_server(request_tx: mpsc::Sender<SocketRequest>) -> Resul
                                 let resp = Response::Error {
                                     message: format!("Invalid request: {}", e),
                                 };
-                                let resp_bytes = serde_json::to_vec(&resp).unwrap();
+                                let resp_bytes = match serde_json::to_vec(&resp) {
+                                    Ok(b) => b,
+                                    Err(e) => {
+                                        error!("Failed to serialize response: {}", e);
+                                        break;
+                                    }
+                                };
                                 let _ = framed.send(BytesMut::from(&resp_bytes[..]).freeze()).await;
                                 continue;
                             }
@@ -165,7 +171,13 @@ pub async fn run_socket_server(request_tx: mpsc::Sender<SocketRequest>) -> Resul
 
                         match reply_rx.await {
                             Ok(response) => {
-                                let resp_bytes = serde_json::to_vec(&response).unwrap();
+                                let resp_bytes = match serde_json::to_vec(&response) {
+                                    Ok(b) => b,
+                                    Err(e) => {
+                                        error!("Failed to serialize response: {}", e);
+                                        break;
+                                    }
+                                };
                                 if framed
                                     .send(BytesMut::from(&resp_bytes[..]).freeze())
                                     .await
