@@ -2,6 +2,10 @@
 name = "server"
 version = "0.1.0"
 edition = "2021"
+publish = false
+
+[package.metadata.dist]
+dist = false
 
 [lib]
 crate-type = ["cdylib"]

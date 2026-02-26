@@ -2,14 +2,14 @@ use std::path::Path;
 use std::process::Command;
 
 fn main() {
-    // Re-run if the server module source changes
+    // Re-run if the server module source changes or if the generated bindings are missing
     println!("cargo:rerun-if-changed=server/src/lib.rs");
     println!("cargo:rerun-if-changed=server/Cargo.toml");
+    println!("cargo:rerun-if-changed=src/module_bindings/mod.rs");
 
     let out_dir = Path::new("src/module_bindings");
 
     // Skip generation if bindings already exist and we're not forced to rebuild.
-    // Cargo will re-run this script when server/src/lib.rs changes (see rerun-if-changed above).
     if out_dir.join("mod.rs").exists() {
         return;
     }
