@@ -3,7 +3,7 @@ members = ["server"]
 
 [package]
 name = "clipsync"
-version = "0.2.4"
+version = "0.3.0"
 edition = "2024"
 description = "Clipboard sync across machines using SpacetimeDB with E2E encryption"
 license = "MIT"

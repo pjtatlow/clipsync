@@ -27,7 +27,11 @@ enum Command {
     /// Sync clipboard content to SpacetimeDB
     Copy,
     /// Get latest clip from SpacetimeDB
-    Paste,
+    Paste {
+        /// Only print the content type (text, image, files) instead of the data
+        #[arg(long)]
+        r#type: bool,
+    },
     /// Show daemon status
     Status,
     /// List registered devices
@@ -63,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Setup { username } => cli::setup::run(username).await?,
         Command::Copy => cli::copy::run().await?,
-        Command::Paste => cli::paste::run().await?,
+        Command::Paste { r#type } => cli::paste::run(r#type).await?,
         Command::Status => cli::status::run().await?,
         Command::Devices => cli::devices::run().await?,
         Command::Config { key, value } => cli::config::run(key, value)?,

@@ -1,0 +1,56 @@
+#!/bin/bash
+# xclip shim that delegates clipboard reads to clipsync.
+# This lets apps like Claude Code read from clipsync's synced clipboard.
+#
+# Install:
+#   sudo ln -s /path/to/xclip-clipsync /usr/local/bin/xclip
+#   (or place this script's directory first on your PATH)
+
+# Parse xclip arguments
+SELECTION=""
+TARGET=""
+OUTPUT=false
+INPUT=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -selection) SELECTION="$2"; shift 2 ;;
+        -t) TARGET="$2"; shift 2 ;;
+        -o) OUTPUT=true; shift ;;
+        -i) INPUT=true; shift ;;
+        *) shift ;;
+    esac
+done
+
+# Allow overriding the clipsync binary path
+CLIPSYNC="${CLIPSYNC_BIN:-clipsync}"
+
+# Only intercept clipboard output (-selection clipboard -o)
+if [[ "$SELECTION" == "clipboard" && "$OUTPUT" == true ]]; then
+    CLIP_TYPE=$($CLIPSYNC paste --type 2>/dev/null)
+
+    # TARGETS query — report what mime types are available
+    if [[ "$TARGET" == "TARGETS" ]]; then
+        case "$CLIP_TYPE" in
+            image) echo "image/png" ;;
+            text)  echo "text/plain" ;;
+            *)     exit 1 ;;
+        esac
+        exit 0
+    fi
+
+    # Image read
+    if [[ "$TARGET" =~ ^image/ && "$CLIP_TYPE" == "image" ]]; then
+        exec $CLIPSYNC paste 2>/dev/null
+    fi
+
+    # Text read
+    if [[ ( "$TARGET" == "text/plain" || -z "$TARGET" ) && "$CLIP_TYPE" == "text" ]]; then
+        exec $CLIPSYNC paste 2>/dev/null
+    fi
+
+    exit 1
+fi
+
+# For writes or other operations, this shim is a no-op
+exit 0
