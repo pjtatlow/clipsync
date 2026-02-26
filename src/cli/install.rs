@@ -11,8 +11,11 @@ fn service_label() -> Result<ServiceLabel> {
 }
 
 pub async fn install() -> Result<()> {
-    let manager = <dyn ServiceManager>::native()
+    let mut manager = <dyn ServiceManager>::native()
         .with_context(|| "Failed to get native service manager")?;
+    manager
+        .set_level(ServiceLevel::User)
+        .with_context(|| "Failed to set service level to user")?;
 
     let exe = std::env::current_exe()?;
 
@@ -44,8 +47,11 @@ pub async fn install() -> Result<()> {
 }
 
 pub async fn uninstall() -> Result<()> {
-    let manager = <dyn ServiceManager>::native()
+    let mut manager = <dyn ServiceManager>::native()
         .with_context(|| "Failed to get native service manager")?;
+    manager
+        .set_level(ServiceLevel::User)
+        .with_context(|| "Failed to set service level to user")?;
 
     // Try to stop first, ignore errors if not running
     let _ = manager.stop(ServiceStopCtx {
