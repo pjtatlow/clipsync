@@ -19,14 +19,9 @@ struct Cli {
 enum Command {
     /// Start the daemon (foreground)
     Daemon,
-    /// Create a new account and register this device
-    Signup {
-        /// Username for the new account
-        username: String,
-    },
-    /// Log in to an existing account and register this device
-    Login {
-        /// Username of the existing account
+    /// Set up this device (creates account or logs in)
+    Setup {
+        /// Username
         username: String,
     },
     /// Sync clipboard content to SpacetimeDB
@@ -59,8 +54,7 @@ async fn main() -> anyhow::Result<()> {
             let config = config::Config::load().unwrap_or_default();
             daemon::run_daemon(config).await?;
         }
-        Command::Signup { username } => cli::signup::run(username).await?,
-        Command::Login { username } => cli::login::run(username).await?,
+        Command::Setup { username } => cli::setup::run(username).await?,
         Command::Copy => cli::copy::run().await?,
         Command::Paste => cli::paste::run().await?,
         Command::Status => cli::status::run().await?,

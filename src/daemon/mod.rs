@@ -18,10 +18,10 @@ use self::spacetime::{SpacetimeCommand, SpacetimeEvent};
 
 pub async fn run_daemon(config: Config) -> Result<()> {
     let device_id = config::load_device_id()?
-        .ok_or_else(|| anyhow::anyhow!("Device not set up. Run `clipsync signup` or `clipsync login` first."))?;
+        .ok_or_else(|| anyhow::anyhow!("Device not set up. Run `clipsync setup` first."))?;
     let token = config::load_token()?;
     let user_id = config::load_user_id()?
-        .ok_or_else(|| anyhow::anyhow!("Not logged in. Run `clipsync signup` or `clipsync login` first."))?;
+        .ok_or_else(|| anyhow::anyhow!("Not logged in. Run `clipsync setup` first."))?;
 
     info!("Starting daemon with device_id={}, user_id={}", device_id, user_id);
 
@@ -281,7 +281,7 @@ async fn handle_request(
                 }
             } else {
                 Response::Error {
-                    message: "No encryption key configured. Run `clipsync signup` or `clipsync login`.".to_string(),
+                    message: "No encryption key configured. Run `clipsync setup`.".to_string(),
                 }
             }
         }

@@ -30,7 +30,6 @@ pub struct User {
 pub struct UserIdentity {
     #[primary_key]
     identity: Identity,
-    #[index(btree)]
     user_id: u64,
 }
 
@@ -39,7 +38,6 @@ pub struct Device {
     #[primary_key]
     #[auto_inc]
     id: u64,
-    #[index(btree)]
     user_id: u64,
     device_id: String,
     device_name: String,
@@ -82,15 +80,39 @@ fn get_user_id(ctx: &ReducerContext) -> Result<u64, String> {
         .identity()
         .find(ctx.sender())
         .map(|ui| ui.user_id)
-        .ok_or_else(|| "Not logged in. Run `clipsync signup` or `clipsync login` first.".to_string())
+        .ok_or_else(|| "Not logged in. Run `clipsync setup` first.".to_string())
+}
+
+fn upsert_device(ctx: &ReducerContext, user_id: u64, device_id: &str, device_name: &str) {
+    for existing in ctx.db.device().iter() {
+        if existing.user_id == user_id && existing.device_id == device_id {
+            ctx.db.device().id().update(Device {
+                device_name: device_name.to_string(),
+                registered_at: ctx.timestamp,
+                ..existing
+            });
+            return;
+        }
+    }
+
+    ctx.db.device().insert(Device {
+        id: 0,
+        user_id,
+        device_id: device_id.to_string(),
+        device_name: device_name.to_string(),
+        registered_at: ctx.timestamp,
+    });
 }
 
 // --- Reducers ---
 
-const MAX_ENCRYPTED_SIZE: usize = 55 * 1024 * 1024; // 55MB overhead margin on 50MB limit
+const MAX_ENCRYPTED_SIZE: usize = 55 * 1024 * 1024;
 
+/// Authenticate a user. Creates a new account if the username doesn't exist,
+/// or logs in if it does. Either way, links this connection's identity to the
+/// user and registers the device.
 #[reducer]
-pub fn signup(
+pub fn authenticate(
     ctx: &ReducerContext,
     username: String,
     password_hash: String,
@@ -106,110 +128,48 @@ pub fn signup(
         return Err("Device ID cannot be empty".to_string());
     }
 
-    // Check username not taken
-    for existing in ctx.db.user().iter() {
-        if existing.username == username {
-            return Err(format!("Username '{}' is already taken", username));
+    // Check if username already exists
+    let user = ctx.db.user().iter().find(|u| u.username == username);
+
+    let user_id = if let Some(existing_user) = user {
+        // Login: verify password
+        if existing_user.password_hash != password_hash {
+            return Err("Invalid password".to_string());
         }
-    }
+        existing_user.id
+    } else {
+        // Signup: create new user
+        let new_user = ctx.db.user().insert(User {
+            id: 0,
+            username: username.clone(),
+            password_hash,
+            encrypted_private_key,
+            public_key,
+            created_at: ctx.timestamp,
+        });
+        log::info!("New user '{}' created (id={})", username, new_user.id);
+        new_user.id
+    };
 
-    // Check this identity isn't already linked to a user
-    if ctx.db.user_identity().identity().find(ctx.sender()).is_some() {
-        return Err("This connection is already linked to a user".to_string());
-    }
-
-    // Create user
-    let user = ctx.db.user().insert(User {
-        id: 0, // auto_inc
-        username: username.clone(),
-        password_hash,
-        encrypted_private_key,
-        public_key,
-        created_at: ctx.timestamp,
-    });
-
-    // Link this identity to the user
-    ctx.db.user_identity().insert(UserIdentity {
-        identity: ctx.sender(),
-        user_id: user.id,
-    });
-
-    // Register device
-    ctx.db.device().insert(Device {
-        id: 0, // auto_inc
-        user_id: user.id,
-        device_id: device_id.clone(),
-        device_name,
-        registered_at: ctx.timestamp,
-    });
-
-    log::info!("User '{}' signed up (id={}), device '{}'", username, user.id, device_id);
-    Ok(())
-}
-
-#[reducer]
-pub fn login(
-    ctx: &ReducerContext,
-    username: String,
-    password_hash: String,
-    device_id: String,
-    device_name: String,
-) -> Result<(), String> {
-    if username.is_empty() {
-        return Err("Username cannot be empty".to_string());
-    }
-
-    // Find user by username
-    let user = ctx
-        .db
-        .user()
-        .iter()
-        .find(|u| u.username == username)
-        .ok_or_else(|| format!("User '{}' not found", username))?;
-
-    // Verify password
-    if user.password_hash != password_hash {
-        return Err("Invalid password".to_string());
-    }
-
-    // Link this identity to the user (or update if already linked)
+    // Link this identity to the user (upsert)
     if let Some(existing) = ctx.db.user_identity().identity().find(ctx.sender()) {
-        if existing.user_id != user.id {
+        if existing.user_id != user_id {
             ctx.db.user_identity().identity().update(UserIdentity {
-                user_id: user.id,
+                user_id,
                 ..existing
             });
         }
     } else {
         ctx.db.user_identity().insert(UserIdentity {
             identity: ctx.sender(),
-            user_id: user.id,
+            user_id,
         });
     }
 
     // Register or update device
-    for existing in ctx.db.device().user_id().filter(&user.id) {
-        if existing.device_id == device_id {
-            ctx.db.device().id().update(Device {
-                device_name,
-                registered_at: ctx.timestamp,
-                ..existing
-            });
-            log::info!("User '{}' logged in, device '{}' updated", username, device_id);
-            return Ok(());
-        }
-    }
+    upsert_device(ctx, user_id, &device_id, &device_name);
 
-    // New device
-    ctx.db.device().insert(Device {
-        id: 0, // auto_inc
-        user_id: user.id,
-        device_id: device_id.clone(),
-        device_name,
-        registered_at: ctx.timestamp,
-    });
-
-    log::info!("User '{}' logged in, new device '{}'", username, device_id);
+    log::info!("User '{}' authenticated, device '{}'", username, device_id);
     Ok(())
 }
 
@@ -224,29 +184,7 @@ pub fn register_device(
     }
 
     let user_id = get_user_id(ctx)?;
-
-    // Dedup by (user_id, device_id)
-    for existing in ctx.db.device().user_id().filter(&user_id) {
-        if existing.device_id == device_id {
-            ctx.db.device().id().update(Device {
-                device_name,
-                registered_at: ctx.timestamp,
-                ..existing
-            });
-            log::info!("Device updated: {} for user {}", device_id, user_id);
-            return Ok(());
-        }
-    }
-
-    ctx.db.device().insert(Device {
-        id: 0, // auto_inc
-        user_id,
-        device_id: device_id.clone(),
-        device_name,
-        registered_at: ctx.timestamp,
-    });
-
-    log::info!("Device registered: {} for user {}", device_id, user_id);
+    upsert_device(ctx, user_id, &device_id, &device_name);
     Ok(())
 }
 
@@ -254,8 +192,8 @@ pub fn register_device(
 pub fn unregister_device(ctx: &ReducerContext, device_id: String) -> Result<(), String> {
     let user_id = get_user_id(ctx)?;
 
-    for existing in ctx.db.device().user_id().filter(&user_id) {
-        if existing.device_id == device_id {
+    for existing in ctx.db.device().iter() {
+        if existing.user_id == user_id && existing.device_id == device_id {
             ctx.db.device().id().delete(&existing.id);
             log::info!("Device unregistered: {} for user {}", device_id, user_id);
             return Ok(());

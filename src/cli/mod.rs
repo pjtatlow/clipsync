@@ -1,9 +1,8 @@
 pub mod copy;
 pub mod devices;
 pub mod install;
-pub mod login;
 pub mod paste;
-pub mod signup;
+pub mod setup;
 pub mod status;
 
 use anyhow::{Context, Result};
