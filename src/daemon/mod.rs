@@ -85,7 +85,7 @@ pub async fn run_daemon(config: Config) -> Result<()> {
                         });
                     }
                     SpacetimeEvent::Disconnected => {
-                        warn!("Disconnected from SpacetimeDB");
+                        warn!("Disconnected from SpacetimeDB, auto-reconnect will be attempted");
                         connected = false;
                     }
                     SpacetimeEvent::SubscriptionApplied => {
