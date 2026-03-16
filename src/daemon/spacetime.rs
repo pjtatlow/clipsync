@@ -69,121 +69,165 @@ pub fn spawn_spacetime_thread(
     std::thread::Builder::new()
         .name("spacetimedb".to_string())
         .spawn(move || {
-            let mut backoff = INITIAL_BACKOFF;
-            let mut first_attempt = true;
-            let mut token = token;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                spacetime_thread_main(server_url, database_name, token, &event_tx, &command_rx);
+            }));
 
-            // Outer reconnection loop
-            loop {
-                if !first_attempt {
-                    info!(
-                        "Reconnecting to SpacetimeDB in {}s...",
-                        backoff.as_secs()
-                    );
-                    std::thread::sleep(backoff);
-
-                    // Reload token in case on_connect saved a newer one
-                    match config::load_token() {
-                        Ok(t) => token = t,
-                        Err(e) => warn!("Failed to reload token: {}", e),
-                    }
-                }
-                first_attempt = false;
-
-                let disconnected = Arc::new(AtomicBool::new(false));
-
-                let event_tx_connect = event_tx.clone();
-                let event_tx_disconnect = event_tx.clone();
-                let event_tx_sub = event_tx.clone();
-                let event_tx_clip = event_tx.clone();
-                let disconnected_cb = disconnected.clone();
-
-                let conn = DbConnection::builder()
-                    .with_uri(&server_url)
-                    .with_database_name(&database_name)
-                    .with_token(token.clone())
-                    .on_connect(move |conn: &DbConnection, identity: Identity, token: &str| {
-                        info!("Connected to SpacetimeDB as {:?}", identity);
-
-                        let _ = event_tx_connect.blocking_send(SpacetimeEvent::Connected {
-                            identity,
-                            token: token.to_string(),
-                        });
-
-                        // Subscribe to all tables (views are scoped to the current user)
-                        let event_tx_for_sub = event_tx_sub.clone();
-                        let event_tx_for_clip = event_tx_clip.clone();
-
-                        conn.subscription_builder()
-                            .on_applied(move |ctx: &SubscriptionEventContext| {
-                                info!("Subscription applied");
-                                let _ = event_tx_for_sub
-                                    .blocking_send(SpacetimeEvent::SubscriptionApplied);
-
-                                let tx = event_tx_for_clip.clone();
-                                ctx.db.my_current_clip().on_insert(
-                                    move |_ctx: &EventContext, row: &CurrentClip| {
-                                        let _ = tx.blocking_send(SpacetimeEvent::ClipUpdated(
-                                            row.clone(),
-                                        ));
-                                    },
-                                );
-                            })
-                            .subscribe_to_all_tables();
-                    })
-                    .on_disconnect(
-                        move |_ctx: &ErrorContext, err: Option<spacetimedb_sdk::Error>| {
-                            if let Some(e) = err {
-                                warn!("Disconnected from SpacetimeDB: {:?}", e);
-                            } else {
-                                info!("Disconnected from SpacetimeDB");
-                            }
-                            disconnected_cb.store(true, Ordering::Release);
-                            let _ =
-                                event_tx_disconnect.blocking_send(SpacetimeEvent::Disconnected);
-                        },
-                    )
-                    .build();
-
-                let conn = match conn {
-                    Ok(c) => c,
-                    Err(e) => {
-                        error!("Failed to connect to SpacetimeDB: {}", e);
-                        backoff = (backoff * 2).min(MAX_BACKOFF);
-                        continue;
-                    }
+            if let Err(panic_info) = result {
+                let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic".to_string()
                 };
-
-                let conn = Arc::new(conn);
-
-                // Run the connection on a background thread
-                let conn_for_run = conn.clone();
-                let _handle = conn_for_run.run_threaded();
-
-                // Reset backoff on successful connection build
-                backoff = INITIAL_BACKOFF;
-
-                // Inner command processing loop
-                loop {
-                    match command_rx.recv_timeout(DISCONNECT_CHECK_INTERVAL) {
-                        Ok(cmd) => handle_command(&conn, cmd),
-                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                            if disconnected.load(Ordering::Acquire) {
-                                info!("Disconnect detected, will attempt reconnect");
-                                break;
-                            }
-                        }
-                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                            info!("Command channel closed, shutting down SpacetimeDB thread");
-                            return;
-                        }
-                    }
-                }
-                // Inner loop exited due to disconnect — outer loop will retry
+                error!("SpacetimeDB thread panicked: {}", msg);
+                // Signal disconnect so the daemon knows the thread is dead
+                let _ = event_tx.blocking_send(SpacetimeEvent::Disconnected);
             }
         })?;
 
     Ok(())
+}
+
+fn spacetime_thread_main(
+    server_url: String,
+    database_name: String,
+    mut token: Option<String>,
+    event_tx: &mpsc::Sender<SpacetimeEvent>,
+    command_rx: &crossbeam_channel::Receiver<SpacetimeCommand>,
+) {
+    let mut backoff = INITIAL_BACKOFF;
+    let mut first_attempt = true;
+
+    // Outer reconnection loop
+    loop {
+        if !first_attempt {
+            info!(
+                "Reconnecting to SpacetimeDB in {}s...",
+                backoff.as_secs()
+            );
+            std::thread::sleep(backoff);
+
+            // Reload token in case on_connect saved a newer one
+            match config::load_token() {
+                Ok(t) => token = t,
+                Err(e) => warn!("Failed to reload token: {}", e),
+            }
+        }
+        first_attempt = false;
+
+        // Drain any commands that queued up during reconnect backoff,
+        // replying with errors so callers don't hang
+        drain_pending_commands(command_rx);
+
+        let disconnected = Arc::new(AtomicBool::new(false));
+
+        let event_tx_connect = event_tx.clone();
+        let event_tx_disconnect = event_tx.clone();
+        let event_tx_sub = event_tx.clone();
+        let event_tx_clip = event_tx.clone();
+        let disconnected_cb = disconnected.clone();
+
+        let conn = DbConnection::builder()
+            .with_uri(&server_url)
+            .with_database_name(&database_name)
+            .with_token(token.clone())
+            .on_connect(move |conn: &DbConnection, identity: Identity, token: &str| {
+                info!("Connected to SpacetimeDB as {:?}", identity);
+
+                let _ = event_tx_connect.blocking_send(SpacetimeEvent::Connected {
+                    identity,
+                    token: token.to_string(),
+                });
+
+                // Subscribe to all tables (views are scoped to the current user)
+                let event_tx_for_sub = event_tx_sub.clone();
+                let event_tx_for_clip = event_tx_clip.clone();
+
+                conn.subscription_builder()
+                    .on_applied(move |ctx: &SubscriptionEventContext| {
+                        info!("Subscription applied");
+                        let _ = event_tx_for_sub
+                            .blocking_send(SpacetimeEvent::SubscriptionApplied);
+
+                        let tx = event_tx_for_clip.clone();
+                        ctx.db.my_current_clip().on_insert(
+                            move |_ctx: &EventContext, row: &CurrentClip| {
+                                let _ = tx.blocking_send(SpacetimeEvent::ClipUpdated(
+                                    row.clone(),
+                                ));
+                            },
+                        );
+                    })
+                    .subscribe_to_all_tables();
+            })
+            .on_disconnect(
+                move |_ctx: &ErrorContext, err: Option<spacetimedb_sdk::Error>| {
+                    if let Some(e) = err {
+                        warn!("Disconnected from SpacetimeDB: {:?}", e);
+                    } else {
+                        info!("Disconnected from SpacetimeDB");
+                    }
+                    disconnected_cb.store(true, Ordering::Release);
+                    let _ = event_tx_disconnect.blocking_send(SpacetimeEvent::Disconnected);
+                },
+            )
+            .build();
+
+        let conn = match conn {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Failed to connect to SpacetimeDB: {}", e);
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+                continue;
+            }
+        };
+
+        let conn = Arc::new(conn);
+
+        // Run the connection on a background thread
+        let conn_for_run = conn.clone();
+        let _handle = conn_for_run.run_threaded();
+
+        // Reset backoff on successful connection build
+        backoff = INITIAL_BACKOFF;
+
+        // Inner command processing loop
+        loop {
+            match command_rx.recv_timeout(DISCONNECT_CHECK_INTERVAL) {
+                Ok(cmd) => handle_command(&conn, cmd),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    if disconnected.load(Ordering::Acquire) {
+                        info!("Disconnect detected, will attempt reconnect");
+                        break;
+                    }
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    info!("Command channel closed, shutting down SpacetimeDB thread");
+                    return;
+                }
+            }
+        }
+        // Inner loop exited due to disconnect — outer loop will retry
+    }
+}
+
+/// Drain any commands that accumulated in the channel during reconnect backoff.
+/// Commands with reply channels get their senders dropped, which signals an error
+/// to the caller rather than leaving them hanging indefinitely.
+fn drain_pending_commands(command_rx: &crossbeam_channel::Receiver<SpacetimeCommand>) {
+    let mut drained = 0;
+    while let Ok(_cmd) = command_rx.try_recv() {
+        drained += 1;
+        // Reply senders are dropped here, causing callers to get Err(Canceled)
+    }
+    if drained > 0 {
+        warn!(
+            "Drained {} commands that queued during reconnect",
+            drained
+        );
+    }
 }
 
 fn handle_command(conn: &DbConnection, cmd: SpacetimeCommand) {

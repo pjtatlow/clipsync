@@ -181,6 +181,22 @@ pub async fn run_daemon(config: Config) -> Result<()> {
     Ok(())
 }
 
+/// Send a command to the SpacetimeDB thread and return the reply channel.
+/// Returns None if the SpacetimeDB thread has died (channel disconnected).
+fn send_stdb_command<T>(
+    stdb_cmd_tx: &crossbeam_channel::Sender<SpacetimeCommand>,
+    make_cmd: impl FnOnce(oneshot::Sender<T>) -> SpacetimeCommand,
+) -> Option<oneshot::Receiver<T>> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    match stdb_cmd_tx.send(make_cmd(reply_tx)) {
+        Ok(()) => Some(reply_rx),
+        Err(_) => {
+            error!("SpacetimeDB thread is dead, cannot send command");
+            None
+        }
+    }
+}
+
 async fn handle_request(
     request: Request,
     connected: bool,
@@ -195,11 +211,13 @@ async fn handle_request(
     match request {
         Request::Status => {
             // Look up username from SpacetimeDB
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let _ = stdb_cmd_tx.send(SpacetimeCommand::GetUsername {
-                reply: reply_tx,
-            });
-            let username = reply_rx.await.ok().flatten();
+            let username = if let Some(reply_rx) =
+                send_stdb_command(stdb_cmd_tx, |reply| SpacetimeCommand::GetUsername { reply })
+            {
+                reply_rx.await.ok().flatten()
+            } else {
+                None
+            };
 
             Response::Status {
                 connected,
@@ -259,10 +277,16 @@ async fn handle_request(
                 };
             }
 
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let _ = stdb_cmd_tx.send(SpacetimeCommand::GetCurrentClip {
-                reply: reply_tx,
-            });
+            let reply_rx = match send_stdb_command(stdb_cmd_tx, |reply| {
+                SpacetimeCommand::GetCurrentClip { reply }
+            }) {
+                Some(rx) => rx,
+                None => {
+                    return Response::Error {
+                        message: "SpacetimeDB thread is not running".to_string(),
+                    };
+                }
+            };
 
             match reply_rx.await {
                 Ok(Some(clip)) => {
@@ -305,10 +329,16 @@ async fn handle_request(
         }
 
         Request::ListDevices => {
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let _ = stdb_cmd_tx.send(SpacetimeCommand::ListDevices {
-                reply: reply_tx,
-            });
+            let reply_rx = match send_stdb_command(stdb_cmd_tx, |reply| {
+                SpacetimeCommand::ListDevices { reply }
+            }) {
+                Some(rx) => rx,
+                None => {
+                    return Response::Error {
+                        message: "SpacetimeDB thread is not running".to_string(),
+                    };
+                }
+            };
 
             match reply_rx.await {
                 Ok(devices) => Response::Devices {
@@ -334,11 +364,19 @@ async fn handle_request(
                 };
             }
 
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let _ = stdb_cmd_tx.send(SpacetimeCommand::CreateInviteCode {
-                code: code.clone(),
-                reply: reply_tx,
-            });
+            let reply_rx = match send_stdb_command(stdb_cmd_tx, |reply| {
+                SpacetimeCommand::CreateInviteCode {
+                    code: code.clone(),
+                    reply,
+                }
+            }) {
+                Some(rx) => rx,
+                None => {
+                    return Response::Error {
+                        message: "SpacetimeDB thread is not running".to_string(),
+                    };
+                }
+            };
 
             match reply_rx.await {
                 Ok(Ok(())) => Response::InviteCreated { code },

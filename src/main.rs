@@ -54,6 +54,17 @@ enum Command {
         /// Arguments passed to xclip
         args: Vec<String>,
     },
+    /// Show daemon logs
+    Logs {
+        /// Follow log output (like tail -f)
+        #[arg(short, long)]
+        follow: bool,
+        /// Number of lines to show (default: 100)
+        #[arg(short = 'n', long)]
+        lines: Option<u32>,
+    },
+    /// Restart the daemon service
+    Restart,
     /// Install as a system service
     Install,
     /// Remove the system service
@@ -84,6 +95,8 @@ async fn main() -> anyhow::Result<()> {
         Command::Config { key, value } => cli::config::run(key, value)?,
         Command::Invite => cli::invite::run().await?,
         Command::Xclip { args } => cli::xclip::run(args).await?,
+        Command::Logs { follow, lines } => cli::logs::run(follow, lines)?,
+        Command::Restart => cli::restart::run()?,
         Command::Install => cli::install::install().await?,
         Command::Uninstall => cli::install::uninstall().await?,
     }
