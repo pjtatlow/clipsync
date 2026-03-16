@@ -3,3 +3,6 @@
   run: |
     curl -sSf https://install.spacetimedb.com | bash -s -- -y
     echo "$HOME/.local/bin" >> $GITHUB_PATH
+    # Pin CLI version to match SDK version in Cargo.lock
+    spacetime version install 2.0.5
+    spacetime version use 2.0.5
