@@ -130,6 +130,7 @@ jobs:
       - name: "Install SpacetimeDB CLI"
         run: |
           curl -sSf https://install.spacetimedb.com | bash -s -- -y
+          export PATH="$HOME/.local/bin:$PATH"
           echo "$HOME/.local/bin" >> $GITHUB_PATH
           # Pin CLI version to match SDK version in Cargo.lock
           spacetime version install 2.0.5
