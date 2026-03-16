@@ -131,6 +131,9 @@ jobs:
         run: |
           curl -sSf https://install.spacetimedb.com | bash -s -- -y
           echo "$HOME/.local/bin" >> $GITHUB_PATH
+          # Pin to 2.0.5 to ensure consistent codegen across all platforms
+          spacetime version install 2.0.5 || true
+          spacetime version use 2.0.5 || true
         shell: "bash"
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
