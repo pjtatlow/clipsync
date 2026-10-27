@@ -12,6 +12,7 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "clipsync",
+    version,
     about = "Encrypted clipboard and configuration sync across machines"
 )]
 struct Cli {

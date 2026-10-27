@@ -3,9 +3,9 @@ exclude = ["server"]
 
 [package]
 name = "clipsync"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
-description = "Clipboard sync across machines using SpacetimeDB with E2E encryption"
+description = "Encrypted clipboard and configuration sync across machines using SpacetimeDB"
 license = "MIT"
 repository = "https://github.com/pjtatlow/clipsync"
 homepage = "https://github.com/pjtatlow/clipsync"
