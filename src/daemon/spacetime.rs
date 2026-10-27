@@ -1,7 +1,7 @@
 use anyhow::Result;
 use spacetimedb_sdk::{DbContext, Identity, Table};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info, warn};
@@ -14,6 +14,9 @@ use crate::module_bindings::create_invite_code_reducer::create_invite_code;
 use crate::module_bindings::register_device_reducer::register_device;
 use crate::module_bindings::sync_clip_reducer::sync_clip;
 
+use crate::module_bindings::acknowledge_file_revision_reducer::acknowledge_file_revision;
+use crate::module_bindings::publish_file_revision_reducer::publish_file_revision;
+
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const DISCONNECT_CHECK_INTERVAL: Duration = Duration::from_millis(250);
@@ -21,10 +24,7 @@ const DISCONNECT_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 // Events sent from SpacetimeDB thread to main loop
 #[derive(Debug)]
 pub enum SpacetimeEvent {
-    Connected {
-        identity: Identity,
-        token: String,
-    },
+    Connected { identity: Identity, token: String },
     Disconnected,
     SubscriptionApplied,
     ClipUpdated(CurrentClip),
@@ -32,6 +32,21 @@ pub enum SpacetimeEvent {
 
 // Commands sent from main loop to SpacetimeDB thread
 pub enum SpacetimeCommand {
+    GetFileState {
+        reply: std::sync::mpsc::Sender<Option<crate::files::RemoteState>>,
+    },
+    PublishFile {
+        collection: String,
+        expected: String,
+        revision: String,
+        device_id: String,
+        encrypted_data: Vec<u8>,
+    },
+    AcknowledgeFile {
+        collection: String,
+        device_id: String,
+        revision: String,
+    },
     SyncClip {
         device_id: String,
         content_type: ClipContentType,
@@ -103,10 +118,7 @@ fn spacetime_thread_main(
     // Outer reconnection loop
     loop {
         if !first_attempt {
-            info!(
-                "Reconnecting to SpacetimeDB in {}s...",
-                backoff.as_secs()
-            );
+            info!("Reconnecting to SpacetimeDB in {}s...", backoff.as_secs());
             std::thread::sleep(backoff);
 
             // Reload token in case on_connect saved a newer one
@@ -121,6 +133,12 @@ fn spacetime_thread_main(
         // replying with errors so callers don't hang
         drain_pending_commands(command_rx);
 
+        let revisions_dirty = Arc::new(AtomicBool::new(true));
+        let revisions_dirty_sub = revisions_dirty.clone();
+        let mut revisions_cache = Arc::new(Vec::new());
+        let ready = Arc::new(AtomicBool::new(false));
+        let ready_sub = ready.clone();
+        let ready_disconnect = ready.clone();
         let disconnected = Arc::new(AtomicBool::new(false));
 
         let event_tx_connect = event_tx.clone();
@@ -133,35 +151,47 @@ fn spacetime_thread_main(
             .with_uri(&server_url)
             .with_database_name(&database_name)
             .with_token(token.clone())
-            .on_connect(move |conn: &DbConnection, identity: Identity, token: &str| {
-                info!("Connected to SpacetimeDB as {:?}", identity);
+            .on_connect(
+                move |conn: &DbConnection, identity: Identity, token: &str| {
+                    info!("Connected to SpacetimeDB as {:?}", identity);
 
-                let _ = event_tx_connect.blocking_send(SpacetimeEvent::Connected {
-                    identity,
-                    token: token.to_string(),
-                });
+                    let _ = event_tx_connect.blocking_send(SpacetimeEvent::Connected {
+                        identity,
+                        token: token.to_string(),
+                    });
 
-                // Subscribe to all tables (views are scoped to the current user)
-                let event_tx_for_sub = event_tx_sub.clone();
-                let event_tx_for_clip = event_tx_clip.clone();
+                    // Subscribe to all tables (views are scoped to the current user)
+                    let event_tx_for_sub = event_tx_sub.clone();
+                    let event_tx_for_clip = event_tx_clip.clone();
 
-                conn.subscription_builder()
-                    .on_applied(move |ctx: &SubscriptionEventContext| {
-                        info!("Subscription applied");
-                        let _ = event_tx_for_sub
-                            .blocking_send(SpacetimeEvent::SubscriptionApplied);
+                    let ready_sub = ready_sub.clone();
+                    let revisions_dirty_sub = revisions_dirty_sub.clone();
+                    conn.subscription_builder()
+                        .on_applied(move |ctx: &SubscriptionEventContext| {
+                            let dirty = revisions_dirty_sub.clone();
+                            ctx.db.my_file_revisions().on_insert(move |_, _| {
+                                dirty.store(true, Ordering::Release);
+                            });
+                            let dirty = revisions_dirty_sub.clone();
+                            ctx.db.my_file_revisions().on_delete(move |_, _| {
+                                dirty.store(true, Ordering::Release);
+                            });
+                            ready_sub.store(true, Ordering::Release);
+                            info!("Subscription applied");
+                            let _ =
+                                event_tx_for_sub.blocking_send(SpacetimeEvent::SubscriptionApplied);
 
-                        let tx = event_tx_for_clip.clone();
-                        ctx.db.my_current_clip().on_insert(
-                            move |_ctx: &EventContext, row: &CurrentClip| {
-                                let _ = tx.blocking_send(SpacetimeEvent::ClipUpdated(
-                                    row.clone(),
-                                ));
-                            },
-                        );
-                    })
-                    .subscribe_to_all_tables();
-            })
+                            let tx = event_tx_for_clip.clone();
+                            ctx.db.my_current_clip().on_insert(
+                                move |_ctx: &EventContext, row: &CurrentClip| {
+                                    let _ =
+                                        tx.blocking_send(SpacetimeEvent::ClipUpdated(row.clone()));
+                                },
+                            );
+                        })
+                        .subscribe_to_all_tables();
+                },
+            )
             .on_disconnect(
                 move |_ctx: &ErrorContext, err: Option<spacetimedb_sdk::Error>| {
                     if let Some(e) = err {
@@ -169,6 +199,7 @@ fn spacetime_thread_main(
                     } else {
                         info!("Disconnected from SpacetimeDB");
                     }
+                    ready_disconnect.store(false, Ordering::Release);
                     disconnected_cb.store(true, Ordering::Release);
                     let _ = event_tx_disconnect.blocking_send(SpacetimeEvent::Disconnected);
                 },
@@ -196,7 +227,13 @@ fn spacetime_thread_main(
         // Inner command processing loop
         loop {
             match command_rx.recv_timeout(DISCONNECT_CHECK_INTERVAL) {
-                Ok(cmd) => handle_command(&conn, cmd),
+                Ok(cmd) => handle_command(
+                    &conn,
+                    cmd,
+                    ready.load(Ordering::Acquire),
+                    &revisions_dirty,
+                    &mut revisions_cache,
+                ),
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                     if disconnected.load(Ordering::Acquire) {
                         info!("Disconnect detected, will attempt reconnect");
@@ -223,24 +260,71 @@ fn drain_pending_commands(command_rx: &crossbeam_channel::Receiver<SpacetimeComm
         // Reply senders are dropped here, causing callers to get Err(Canceled)
     }
     if drained > 0 {
-        warn!(
-            "Drained {} commands that queued during reconnect",
-            drained
-        );
+        warn!("Drained {} commands that queued during reconnect", drained);
     }
 }
 
-fn handle_command(conn: &DbConnection, cmd: SpacetimeCommand) {
+fn handle_command(
+    conn: &DbConnection,
+    cmd: SpacetimeCommand,
+    ready: bool,
+    revisions_dirty: &AtomicBool,
+    revisions_cache: &mut Arc<Vec<FileRevision>>,
+) {
     match cmd {
+        SpacetimeCommand::GetFileState { reply } => {
+            if ready && revisions_dirty.swap(false, Ordering::AcqRel) {
+                *revisions_cache = Arc::new(conn.db.my_file_revisions().iter().collect());
+            }
+            let _ = reply.send(if ready {
+                Some(crate::files::RemoteState {
+                    heads: conn.db.my_file_heads().iter().collect(),
+                    revisions: revisions_cache.clone(),
+                    applied: conn.db.my_file_applied().iter().collect(),
+                })
+            } else {
+                None
+            });
+        }
+        SpacetimeCommand::PublishFile {
+            collection,
+            expected,
+            revision,
+            device_id,
+            encrypted_data,
+        } => {
+            if ready
+                && let Err(e) = conn.reducers.publish_file_revision(
+                    collection,
+                    expected,
+                    revision,
+                    device_id,
+                    encrypted_data,
+                )
+            {
+                warn!("File publication failed; will retry: {e}");
+            }
+        }
+        SpacetimeCommand::AcknowledgeFile {
+            collection,
+            device_id,
+            revision,
+        } => {
+            if ready {
+                let _ = conn
+                    .reducers
+                    .acknowledge_file_revision(collection, device_id, revision);
+            }
+        }
         SpacetimeCommand::SyncClip {
             device_id,
             content_type,
             encrypted_data,
             size_bytes,
         } => {
-            if let Err(e) = conn
-                .reducers
-                .sync_clip(device_id, content_type, encrypted_data, size_bytes)
+            if let Err(e) =
+                conn.reducers
+                    .sync_clip(device_id, content_type, encrypted_data, size_bytes)
             {
                 error!("Failed to call sync_clip: {}", e);
             }

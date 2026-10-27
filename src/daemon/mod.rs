@@ -23,7 +23,10 @@ pub async fn run_daemon(config: Config) -> Result<()> {
     let user_id = config::load_user_id()?
         .ok_or_else(|| anyhow::anyhow!("Not logged in. Run `clipsync setup` first."))?;
 
-    info!("Starting daemon with device_id={}, user_id={}", device_id, user_id);
+    info!(
+        "Starting daemon with device_id={}, user_id={}",
+        device_id, user_id
+    );
 
     // Channels for SpacetimeDB
     let (stdb_event_tx, mut stdb_event_rx) = mpsc::channel::<SpacetimeEvent>(32);
@@ -47,6 +50,9 @@ pub async fn run_daemon(config: Config) -> Result<()> {
 
     // Spawn socket server
     let mut socket_handle = tokio::spawn(socket::run_socket_server(socket_req_tx));
+
+    // File sync owns its durable registry and Git repositories on a separate actor thread.
+    let files_tx = crate::files::spawn(device_id.clone(), stdb_cmd_tx.clone())?;
 
     // State
     let mut connected = false;
@@ -140,6 +146,16 @@ pub async fn run_daemon(config: Config) -> Result<()> {
 
             // Socket requests from CLI
             Some(req) = socket_req_rx.recv() => {
+                // File history/recovery can involve disk I/O. Await its actor reply in
+                // a separate task so clipboard updates keep flowing meanwhile.
+                if let Request::Files { command } = req.request {
+                    let files_tx = files_tx.clone();
+                    tokio::spawn(async move {
+                        let response = handle_files(command, &files_tx).await;
+                        let _ = req.reply.send(response);
+                    });
+                    continue;
+                }
                 let response = handle_request(
                     req.request,
                     connected,
@@ -150,6 +166,7 @@ pub async fn run_daemon(config: Config) -> Result<()> {
                     &stdb_cmd_tx,
                     &clip_cmd_tx,
                     &shutdown_tx,
+                    &files_tx,
                 ).await;
                 let _ = req.reply.send(response);
             }
@@ -207,8 +224,10 @@ async fn handle_request(
     stdb_cmd_tx: &crossbeam_channel::Sender<SpacetimeCommand>,
     clip_cmd_tx: &std::sync::mpsc::Sender<ClipboardCommand>,
     shutdown_tx: &watch::Sender<bool>,
+    files_tx: &std::sync::mpsc::Sender<crate::files::FileRequest>,
 ) -> Response {
     match request {
+        Request::Files { command } => handle_files(command, files_tx).await,
         Request::Status => {
             // Look up username from SpacetimeDB
             let username = if let Some(reply_rx) =
@@ -248,12 +267,12 @@ async fn handle_request(
                     Ok(None) => {
                         return Response::Error {
                             message: "Clipboard is empty".to_string(),
-                        }
+                        };
                     }
                     Err(_) => {
                         return Response::Error {
                             message: "Clipboard read failed".to_string(),
-                        }
+                        };
                     }
                 }
             };
@@ -364,19 +383,18 @@ async fn handle_request(
                 };
             }
 
-            let reply_rx = match send_stdb_command(stdb_cmd_tx, |reply| {
-                SpacetimeCommand::CreateInviteCode {
+            let reply_rx =
+                match send_stdb_command(stdb_cmd_tx, |reply| SpacetimeCommand::CreateInviteCode {
                     code: code.clone(),
                     reply,
-                }
-            }) {
-                Some(rx) => rx,
-                None => {
-                    return Response::Error {
-                        message: "SpacetimeDB thread is not running".to_string(),
-                    };
-                }
-            };
+                }) {
+                    Some(rx) => rx,
+                    None => {
+                        return Response::Error {
+                            message: "SpacetimeDB thread is not running".to_string(),
+                        };
+                    }
+                };
 
             match reply_rx.await {
                 Ok(Ok(())) => Response::InviteCreated { code },
@@ -403,9 +421,12 @@ fn encrypt_and_sync(
 ) -> Result<(), String> {
     let age_id = age_identity.ok_or("No encryption key configured. Run `clipsync setup`.")?;
     let recipient = age_id.to_public();
-    let data = payload.serialize().map_err(|e| format!("Serialization failed: {}", e))?;
+    let data = payload
+        .serialize()
+        .map_err(|e| format!("Serialization failed: {}", e))?;
     let size_bytes = data.len() as u64;
-    let encrypted = crypto::encrypt(&data, &[recipient]).map_err(|e| format!("Encryption failed: {}", e))?;
+    let encrypted =
+        crypto::encrypt(&data, &[recipient]).map_err(|e| format!("Encryption failed: {}", e))?;
     let content_type = match payload {
         ClipboardPayload::Text(_) => ClipContentType::Text,
         ClipboardPayload::Image { .. } => ClipContentType::Image,
@@ -420,7 +441,27 @@ fn encrypt_and_sync(
 }
 
 fn hostname() -> String {
-    gethostname::gethostname()
-        .to_string_lossy()
-        .into_owned()
+    gethostname::gethostname().to_string_lossy().into_owned()
+}
+
+async fn handle_files(
+    command: crate::files::FileCommand,
+    files_tx: &std::sync::mpsc::Sender<crate::files::FileRequest>,
+) -> Response {
+    let (reply, rx) = oneshot::channel();
+    if files_tx
+        .send(crate::files::FileRequest { command, reply })
+        .is_err()
+    {
+        return Response::Error {
+            message: "File sync worker is unavailable".into(),
+        };
+    }
+    match rx.await {
+        Ok(Ok(output)) => Response::FileResult { output },
+        Ok(Err(message)) => Response::Error { message },
+        Err(_) => Response::Error {
+            message: "File sync worker stopped".into(),
+        },
+    }
 }

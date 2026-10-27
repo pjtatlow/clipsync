@@ -33,8 +33,7 @@ pub fn store_private_key(identity: &x25519::Identity) -> Result<()> {
 
 pub fn load_private_key() -> Result<x25519::Identity> {
     let path = identity_file_path()?;
-    let key_str =
-        std::fs::read_to_string(&path).with_context(|| "Failed to read identity file")?;
+    let key_str = std::fs::read_to_string(&path).with_context(|| "Failed to read identity file")?;
     let identity: x25519::Identity = key_str
         .trim()
         .parse()
@@ -43,9 +42,9 @@ pub fn load_private_key() -> Result<x25519::Identity> {
 }
 
 pub fn encrypt_with_passphrase(data: &[u8], passphrase: &str) -> Result<Vec<u8>> {
-    let encryptor = age::Encryptor::with_user_passphrase(
-        age::secrecy::SecretString::from(passphrase.to_string()),
-    );
+    let encryptor = age::Encryptor::with_user_passphrase(age::secrecy::SecretString::from(
+        passphrase.to_string(),
+    ));
 
     let mut encrypted = vec![];
     let mut writer = encryptor
@@ -65,9 +64,8 @@ pub fn decrypt_with_passphrase(encrypted: &[u8], passphrase: &str) -> Result<Vec
     let decryptor = age::Decryptor::new(encrypted)
         .map_err(|e| anyhow::anyhow!("Failed to create passphrase decryptor: {}", e))?;
 
-    let identity = age::scrypt::Identity::new(
-        age::secrecy::SecretString::from(passphrase.to_string()),
-    );
+    let identity =
+        age::scrypt::Identity::new(age::secrecy::SecretString::from(passphrase.to_string()));
 
     let mut decrypted = vec![];
     let mut reader = decryptor
@@ -131,6 +129,34 @@ pub fn public_key_bytes(recipient: &x25519::Recipient) -> Vec<u8> {
     // The plan says 32 bytes but age's Recipient doesn't expose raw bytes directly.
     // We'll store the bech32 string representation.
     recipient.to_string().into_bytes()
+}
+
+/// Bound both age plaintext and zstd expansion for untrusted file revisions.
+pub fn decrypt_limited(
+    encrypted: &[u8],
+    identity: &x25519::Identity,
+    limit: usize,
+) -> Result<Vec<u8>> {
+    let decryptor = age::Decryptor::new(encrypted)?;
+    let reader = decryptor.decrypt(std::iter::once(identity as &dyn age::Identity))?;
+    let mut compressed = Vec::new();
+    reader
+        .take((limit + 1) as u64)
+        .read_to_end(&mut compressed)?;
+    anyhow::ensure!(
+        compressed.len() <= limit,
+        "Encrypted revision expands beyond limit"
+    );
+    let decoder = zstd::stream::read::Decoder::new(compressed.as_slice())?;
+    let mut plaintext = Vec::new();
+    decoder
+        .take((limit + 1) as u64)
+        .read_to_end(&mut plaintext)?;
+    anyhow::ensure!(
+        plaintext.len() <= limit,
+        "Decompressed revision exceeds limit"
+    );
+    Ok(plaintext)
 }
 
 #[cfg(test)]

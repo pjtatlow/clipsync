@@ -11,6 +11,7 @@ pub enum Request {
     ListDevices,
     CreateInvite { code: String },
     Shutdown,
+    Files { command: crate::files::FileCommand },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +23,9 @@ pub struct DeviceInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Response {
+    FileResult {
+        output: String,
+    },
     Ok,
     Status {
         connected: bool,

@@ -222,10 +222,7 @@ fn record_failed_login(ctx: &ReducerContext, username: &String) -> String {
 
 /// Clear failed login attempts on successful authentication.
 fn clear_failed_logins(ctx: &ReducerContext, username: &String) {
-    ctx.db
-        .failed_login()
-        .username()
-        .delete(username);
+    ctx.db.failed_login().username().delete(username);
 }
 
 /// Check if the account is locked due to too many failed attempts.
@@ -244,10 +241,7 @@ fn check_brute_force_lockout(ctx: &ReducerContext, username: &String) -> Result<
         );
         if now > window_end {
             // Window expired, reset the record
-            ctx.db
-                .failed_login()
-                .username()
-                .delete(username);
+            ctx.db.failed_login().username().delete(username);
         }
     }
     Ok(())
@@ -528,4 +522,190 @@ fn my_devices(ctx: &ViewContext) -> Vec<DeviceView> {
 fn my_current_clip(ctx: &ViewContext) -> Option<CurrentClip> {
     let ui = ctx.db.user_identity().identity().find(ctx.sender())?;
     ctx.db.current_clip().user_id().find(&ui.user_id)
+}
+
+// File revisions are immutable. Heads move only through compare-and-swap.
+#[table(accessor = file_revision)]
+#[derive(Clone)]
+pub struct FileRevision {
+    #[primary_key]
+    pub id: String,
+    #[index(btree)]
+    pub user_id: u64,
+    pub collection: String,
+    pub parent: String,
+    pub device_id: String,
+    pub encrypted_data: Vec<u8>,
+    pub created_at: Timestamp,
+}
+
+#[table(accessor = file_head)]
+#[derive(Clone)]
+pub struct FileHead {
+    #[primary_key]
+    pub key: String,
+    #[index(btree)]
+    pub user_id: u64,
+    pub collection: String,
+    pub revision: String,
+}
+
+#[table(accessor = file_applied)]
+#[derive(Clone)]
+pub struct FileApplied {
+    #[primary_key]
+    pub key: String,
+    #[index(btree)]
+    pub user_id: u64,
+    pub collection: String,
+    pub device_id: String,
+    pub revision: String,
+    pub applied_at: Timestamp,
+}
+
+#[reducer]
+pub fn publish_file_revision(
+    ctx: &ReducerContext,
+    collection: String,
+    expected: String,
+    revision: String,
+    device_id: String,
+    encrypted_data: Vec<u8>,
+) -> Result<(), String> {
+    let user_id = get_user_id(ctx)?;
+    if collection.is_empty()
+        || collection.len() > 64
+        || !collection
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        || revision.len() > 64
+        || revision.is_empty()
+        || device_id.len() > 128
+        || encrypted_data.len() > 8 * 1024 * 1024
+    {
+        return Err("Invalid file revision or size limit exceeded".into());
+    }
+    if !ctx
+        .db
+        .device()
+        .user_id()
+        .filter(&user_id)
+        .any(|d| d.device_id == device_id)
+    {
+        return Err("Device is not registered".into());
+    }
+    if let Some(existing) = ctx.db.file_revision().id().find(&revision) {
+        return if existing.user_id == user_id
+            && existing.collection == collection
+            && existing.parent == expected
+            && existing.device_id == device_id
+            && existing.encrypted_data == encrypted_data
+        {
+            Ok(()) // Lost acknowledgement: a byte-identical retry is safe.
+        } else {
+            Err("Revision ID already exists".into())
+        };
+    }
+    let key = format!("{user_id}:{collection}");
+    let old = ctx.db.file_head().key().find(&key);
+    let current = old.as_ref().map(|h| h.revision.as_str()).unwrap_or("");
+    if current != expected {
+        return Err("File head changed; reconcile before retrying".into());
+    }
+    ctx.db.file_revision().insert(FileRevision {
+        id: revision.clone(),
+        user_id,
+        collection: collection.clone(),
+        parent: expected,
+        device_id,
+        encrypted_data,
+        created_at: ctx.timestamp,
+    });
+    let head = FileHead {
+        key,
+        user_id,
+        collection,
+        revision,
+    };
+    if old.is_some() {
+        ctx.db.file_head().key().update(head);
+    } else {
+        ctx.db.file_head().insert(head);
+    }
+    Ok(())
+}
+
+#[reducer]
+pub fn acknowledge_file_revision(
+    ctx: &ReducerContext,
+    collection: String,
+    device_id: String,
+    revision: String,
+) -> Result<(), String> {
+    let user_id = get_user_id(ctx)?;
+    let rev = ctx
+        .db
+        .file_revision()
+        .id()
+        .find(&revision)
+        .ok_or("Unknown revision")?;
+    if rev.user_id != user_id
+        || rev.collection != collection
+        || !ctx
+            .db
+            .device()
+            .user_id()
+            .filter(&user_id)
+            .any(|d| d.device_id == device_id)
+    {
+        return Err("Invalid acknowledgement".into());
+    }
+    let key = format!("{user_id}:{collection}:{device_id}");
+    let old = ctx.db.file_applied().key().find(&key);
+    let row = FileApplied {
+        key,
+        user_id,
+        collection,
+        device_id,
+        revision,
+        applied_at: ctx.timestamp,
+    };
+    if old.is_some() {
+        ctx.db.file_applied().key().update(row);
+    } else {
+        ctx.db.file_applied().insert(row);
+    }
+    Ok(())
+}
+
+#[view(accessor = my_file_revisions, public)]
+fn my_file_revisions(ctx: &ViewContext) -> Vec<FileRevision> {
+    let Some(ui) = ctx.db.user_identity().identity().find(ctx.sender()) else {
+        return vec![];
+    };
+    ctx.db
+        .file_revision()
+        .user_id()
+        .filter(&ui.user_id)
+        .collect()
+}
+
+#[view(accessor = my_file_heads, public)]
+fn my_file_heads(ctx: &ViewContext) -> Vec<FileHead> {
+    let Some(ui) = ctx.db.user_identity().identity().find(ctx.sender()) else {
+        return vec![];
+    };
+    ctx.db.file_head().user_id().filter(&ui.user_id).collect()
+}
+
+#[view(accessor = my_file_applied, public)]
+fn my_file_applied(ctx: &ViewContext) -> Vec<FileApplied> {
+    let Some(ui) = ctx.db.user_identity().identity().find(ctx.sender()) else {
+        return vec![];
+    };
+    ctx.db
+        .file_applied()
+        .user_id()
+        .filter(&ui.user_id)
+        .collect()
 }

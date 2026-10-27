@@ -38,10 +38,12 @@ futures = "0.3"
 service-manager = "0.7"
 libc = "0.2"
 nix = { version = "0.29", default-features = false, features = ["user"] }
-spacetimedb-sdk = "2.0"
+spacetimedb-sdk = "=2.0.5"
 openssl = { version = "0.10", features = ["vendored"], optional = true }
 gethostname = "0.5"
 rpassword = "7"
+sha2 = "0.10"
+hmac = "0.12"
 
 # The profile that 'dist' will build with
 [profile.dist]

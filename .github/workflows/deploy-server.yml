@@ -1,0 +1,88 @@
+name: Deploy server
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'server/**'
+      - 'spacetime.json'
+      - '.github/workflows/deploy-server.yml'
+  pull_request:
+    paths:
+      - 'server/**'
+      - 'spacetime.json'
+      - '.github/workflows/deploy-server.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Serialize the entire main-branch pipeline so a slower, older build cannot
+# publish after a newer one. Pull-request refs get independent build groups.
+concurrency:
+  group: clipsync-server-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build server
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Build locked server module
+        run: cargo build --manifest-path server/Cargo.toml --target wasm32-unknown-unknown --release --locked
+      - uses: actions/upload-artifact@v6
+        with:
+          name: server-wasm
+          path: server/target/wasm32-unknown-unknown/release/server.wasm
+          if-no-files-found: error
+          retention-days: 7
+
+  deploy:
+    name: Publish to Maincloud
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: server-wasm
+          path: module
+      - name: Install SpacetimeDB CLI
+        shell: bash
+        run: |
+          curl --fail --silent --show-error https://install.spacetimedb.com -o "$RUNNER_TEMP/install-spacetime.sh"
+          bash "$RUNNER_TEMP/install-spacetime.sh" -y
+          export PATH="$HOME/.local/bin:$PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          spacetime version install 2.0.5
+          spacetime version use 2.0.5
+      - name: Authenticate deployment account
+        env:
+          SPACETIME_TOKEN: ${{ secrets.SPACETIME_TOKEN }}
+        shell: bash
+        run: |
+          if [[ -z "$SPACETIME_TOKEN" ]]; then
+            echo '::error::Add the SPACETIME_TOKEN repository secret for an account authorized to publish clipsync on Maincloud.'
+            exit 1
+          fi
+          spacetime login --token "$SPACETIME_TOKEN" > /dev/null
+      - name: Publish compatible update
+        shell: bash
+        run: |
+          # CLI 2.0.5 --yes also accepts client-breaking updates. Confirm only
+          # the non-local target prompt; decline any subsequent breaking prompt.
+          # --no-config prevents repository configuration from overriding policy.
+          printf 'y\nn\n' | spacetime publish \
+            --no-config \
+            --server https://maincloud.spacetimedb.com \
+            --delete-data=never \
+            --bin-path module/server.wasm \
+            clipsync

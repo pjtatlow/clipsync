@@ -1,3 +1,4 @@
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::process::Command;
 
@@ -9,8 +10,18 @@ fn main() {
 
     let out_dir = Path::new("src/module_bindings");
 
-    // Skip generation if bindings already exist and we're not forced to rebuild.
-    if out_dir.join("mod.rs").exists() {
+    // Generated bindings must match the current schema, not merely exist.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for source in ["server/src/lib.rs", "server/Cargo.toml"] {
+        std::fs::read(source)
+            .expect("read server schema")
+            .hash(&mut hasher);
+    }
+    let fingerprint = hasher.finish().to_string();
+    let stamp = out_dir.join(".schema-fingerprint");
+    if out_dir.join("mod.rs").exists()
+        && std::fs::read_to_string(&stamp).ok().as_deref() == Some(&fingerprint)
+    {
         return;
     }
 
@@ -37,6 +48,7 @@ fn main() {
     if !status.success() {
         panic!("spacetime generate failed with exit code: {}", status);
     }
+    std::fs::write(stamp, fingerprint).expect("write schema fingerprint");
 }
 
 fn which(binary: &str) -> Option<String> {

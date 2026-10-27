@@ -1,3 +1,5 @@
 /target
 src/module_bindings/
 test-module/
+
+/server/target

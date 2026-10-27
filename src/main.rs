@@ -2,6 +2,7 @@ mod cli;
 mod config;
 mod crypto;
 mod daemon;
+mod files;
 mod module_bindings;
 mod payload;
 mod protocol;
@@ -9,7 +10,10 @@ mod protocol;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "clipsync", about = "Clipboard sync across machines")]
+#[command(
+    name = "clipsync",
+    about = "Encrypted clipboard and configuration sync across machines"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -34,6 +38,11 @@ enum Command {
         /// Only print the content type (text, image, files) instead of the data
         #[arg(long)]
         r#type: bool,
+    },
+    /// Manage live, versioned configuration collections
+    Files {
+        #[command(subcommand)]
+        command: files::FileCommand,
     },
     /// Show daemon status
     Status,
@@ -87,9 +96,36 @@ async fn main() -> anyhow::Result<()> {
             let config = config::Config::load().unwrap_or_default();
             daemon::run_daemon(config).await?;
         }
-        Command::Setup { username, invite_code } => cli::setup::run(username, invite_code).await?,
+        Command::Setup {
+            username,
+            invite_code,
+        } => cli::setup::run(username, invite_code).await?,
         Command::Copy => cli::copy::run().await?,
         Command::Paste { r#type } => cli::paste::run(r#type).await?,
+        Command::Files { command } => {
+            // Resolve relative paths in the caller's working directory, not the daemon's.
+            let command = match command {
+                files::FileCommand::Add {
+                    name,
+                    path,
+                    directory,
+                } => files::FileCommand::Add {
+                    name,
+                    path: if path.is_absolute() {
+                        path
+                    } else {
+                        std::env::current_dir()?.join(path)
+                    },
+                    directory,
+                },
+                other => other,
+            };
+            match cli::send_request(protocol::Request::Files { command }).await? {
+                protocol::Response::FileResult { output } => println!("{output}"),
+                protocol::Response::Error { message } => anyhow::bail!(message),
+                _ => anyhow::bail!("Unexpected daemon response"),
+            }
+        }
         Command::Status => cli::status::run().await?,
         Command::Devices => cli::devices::run().await?,
         Command::Config { key, value } => cli::config::run(key, value)?,
