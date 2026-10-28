@@ -224,6 +224,32 @@ fn live_two_device_sync_conflict_resolution_and_rollback() {
         a.historical_snapshot(&name, "HEAD").unwrap(),
         snapshot("initial\n")
     );
+    // Join an existing directory collection at an absent destination without
+    // --directory: the authenticated remote snapshot must establish its type.
+    let directory_name = format!("test-directory-{}", uuid::Uuid::new_v4());
+    let directory_a = temp1.0.join("rex");
+    let directory_b = temp2.0.join("rex");
+    fs::create_dir(&directory_a).unwrap();
+    fs::write(directory_a.join("init.lua"), "return {}\n").unwrap();
+    add(&mut a, &directory_name, directory_a.clone());
+    a.queue(&directory_name, scan(&directory_a, true).unwrap())
+        .unwrap();
+    wait(|| {
+        a.refresh();
+        a.tick(&directory_name).unwrap();
+        !a.registry.collections[&directory_name].base.is_empty()
+    });
+    add(&mut b, &directory_name, directory_b.clone());
+    wait(|| {
+        b.refresh();
+        b.tick(&directory_name).unwrap();
+        fs::read_to_string(directory_b.join("init.lua"))
+            .ok()
+            .as_deref()
+            == Some("return {}\n")
+    });
+    assert!(b.registry.collections[&directory_name].directory);
+    assert!(b.registry.collections[&directory_name].error.is_none());
     for (conn, device) in [(conn1, a.device.clone()), (conn2, b.device.clone())] {
         let (tx, rx) = std::sync::mpsc::channel();
         conn.reducers

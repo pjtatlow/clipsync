@@ -23,6 +23,7 @@ pub enum FileCommand {
     Add {
         name: String,
         path: PathBuf,
+        /// Treat a missing path as a directory immediately instead of waiting to infer its type.
         #[arg(long)]
         directory: bool,
     },
@@ -473,6 +474,58 @@ impl Engine {
             });
         }
     }
+    /// An empty, unpublished default-file registration has no established type.
+    /// Infer it from authenticated remote content or the first local path that appears.
+    fn reconcile_collection_type(&mut self, name: &str) -> Result<bool> {
+        let c = &self.registry.collections[name];
+        if c.directory
+            || !c.base.is_empty()
+            || !c.installed.entries.is_empty()
+            || c.pending
+                .as_ref()
+                .is_some_and(|p| !p.snapshot.entries.is_empty())
+            || c.applying.is_some()
+        {
+            return Ok(true);
+        }
+        reject_symlinks(&c.path)?;
+        let head = self.head(name);
+        let directory = if !head.is_empty() {
+            let incoming = self.decode(name, &head)?;
+            if (incoming.directory && c.path.is_file()) || (!incoming.directory && c.path.is_dir())
+            {
+                bail!(
+                    "Local path type differs from the remote collection at {}",
+                    c.path.display()
+                );
+            }
+            incoming.directory
+        } else if c.path.is_dir() {
+            true
+        } else if c.path.try_exists()? {
+            false
+        } else {
+            // Do not invent and publish an empty file while the type is unknown.
+            return Ok(false);
+        };
+        if directory {
+            let previous = c.clone();
+            let c = self.registry.collections.get_mut(name).unwrap();
+            c.directory = true;
+            c.installed.directory = true;
+            // An empty pending snapshot from an unresolved registration contains no
+            // edits to preserve; capture the correctly typed snapshot instead.
+            c.pending = None;
+            c.conflict = None;
+            c.error = None;
+            if let Err(error) = self.save() {
+                self.registry.collections.insert(name.into(), previous);
+                return Err(error);
+            }
+            self.observed.remove(name);
+        }
+        Ok(true)
+    }
     fn tick(&mut self, name: &str) -> Result<()> {
         if self.registry.collections[name].applying.is_some() {
             // A crash can interrupt a multi-file deployment. Keep the journal and require
@@ -480,6 +533,13 @@ impl Engine {
             bail!(
                 "Interrupted application; preserved journal. Use files resolve {name} remote or local"
             );
+        }
+        if !self.reconcile_collection_type(name)? {
+            let c = self.registry.collections.get_mut(name).unwrap();
+            if c.error.take().is_some() {
+                self.save()?;
+            }
+            return Ok(());
         }
         let c = self.registry.collections[name].clone();
         let local = scan(&c.path, c.directory)?;
@@ -511,7 +571,10 @@ impl Engine {
                     return Ok(());
                 }
                 let incoming = self.decode(name, &head)?;
-                if c.pending.is_none() && local == incoming {
+                if c.pending.is_none()
+                    && local == incoming
+                    && (!incoming.directory || c.path.is_dir())
+                {
                     // Joining with exactly the same bytes needs no deployment or conflict.
                     self.record(name, &incoming, &format!("adopt matching {head}"))?;
                     let c = self.registry.collections.get_mut(name).unwrap();
@@ -691,6 +754,13 @@ impl Engine {
                             "interrupted application"
                         } else if c.conflict.is_some() {
                             "CONFLICT"
+                        } else if !c.directory
+                            && c.base.is_empty()
+                            && c.installed.entries.is_empty()
+                            && !c.path.exists()
+                            && self.head(name).is_empty()
+                        {
+                            "waiting for local path or remote collection"
                         } else if c.pending.is_some() {
                             "pending publication"
                         } else {
@@ -719,6 +789,8 @@ impl Engine {
                 self.git(&name, &["log", "--format=%h %ai %s", "-50"])
             }
             FileCommand::Diff { name } => {
+                self.collection(&name)?;
+                self.reconcile_collection_type(&name)?;
                 let c = self.collection(&name)?;
                 let local = scan(&c.path, c.directory)?;
                 let baseline = c
@@ -761,6 +833,7 @@ impl Engine {
                 if head.is_empty() {
                     bail!("No remote revision to resolve against");
                 }
+                self.reconcile_collection_type(&name)?;
                 let c = self.registry.collections[&name].clone();
                 let local = scan(&c.path, c.directory)?;
                 self.record(&name, &local, "backup before explicit resolution")?;
@@ -1005,6 +1078,11 @@ fn install(root: &Path, before: &Snapshot, after: &Snapshot) -> Result<()> {
                 bail!("File/directory collision at {}", parent.display());
             }
         }
+    }
+    if after.directory && !root.exists() {
+        reject_symlinks(root)?;
+        fs::create_dir_all(root)?;
+        fs::File::open(root.parent().context("Missing parent directory")?)?.sync_all()?;
     }
     for (key, entry) in &after.entries {
         if before.entries.get(key) != Some(entry) {
@@ -1458,6 +1536,146 @@ mod tests {
         assert_eq!(e.historical_snapshot("test", "HEAD").unwrap(), original);
         let encrypted = e.git_bytes("test", &["show", "HEAD:snapshot.age"]).unwrap();
         assert!(open(&crypto::generate_keypair().0, &encrypted).is_err());
+    }
+    #[test]
+    fn missing_path_waits_instead_of_publishing_an_empty_file() {
+        let t = Temp::new();
+        let mut e = t.engine();
+        add(&mut e, "test", t.0.join("missing"));
+        e.observed.insert(
+            "test".into(),
+            (
+                Snapshot::default().hash().unwrap(),
+                Instant::now() - Duration::from_secs(1),
+            ),
+        );
+        e.tick("test").unwrap();
+        assert!(e.registry.collections["test"].pending.is_none());
+        assert!(
+            e.command(FileCommand::Status)
+                .unwrap()
+                .contains("waiting for local path")
+        );
+    }
+    #[test]
+    fn later_created_directory_is_inferred_and_captured_without_reregistering() {
+        let t = Temp::new();
+        let mut e = t.engine();
+        let path = t.0.join("missing");
+        add(&mut e, "test", path.clone());
+        e.tick("test").unwrap();
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("config.lua"), "return {}").unwrap();
+        e.registry.collections.get_mut("test").unwrap().error = Some("Expected a file".into());
+        e.tick("test").unwrap();
+        assert!(e.registry.collections["test"].directory);
+        assert!(e.registry.collections["test"].error.is_none());
+        let saved: Registry =
+            serde_json::from_slice(&fs::read(e.root.join("registry.json")).unwrap()).unwrap();
+        assert!(saved.collections["test"].directory);
+        let snapshot = scan(&path, true).unwrap();
+        e.observed.insert(
+            "test".into(),
+            (
+                snapshot.hash().unwrap(),
+                Instant::now() - Duration::from_secs(1),
+            ),
+        );
+        e.tick("test").unwrap();
+        assert_eq!(
+            e.registry.collections["test"]
+                .pending
+                .as_ref()
+                .unwrap()
+                .snapshot,
+            snapshot
+        );
+    }
+    #[test]
+    fn missing_destination_infers_remote_directory_and_recovers_empty_pending_state() {
+        let t = Temp::new();
+        let mut e = t.engine();
+        let path = t.0.join("missing");
+        add(&mut e, "test", path.clone());
+        // Reproduce the old failure state: a missing path captured as an empty file.
+        e.queue("test", Snapshot::default()).unwrap();
+        e.registry.collections.get_mut("test").unwrap().error =
+            Some("Collection type differs between devices".into());
+        let incoming = Snapshot {
+            directory: true,
+            entries: BTreeMap::from([(
+                "nested/init.lua".into(),
+                Entry {
+                    data: b"return {}".to_vec(),
+                    executable: false,
+                },
+            )]),
+        };
+        e.remote = Some(remote(
+            &e,
+            "test",
+            "directory-revision",
+            "",
+            incoming.clone(),
+        ));
+        e.tick("test").unwrap();
+        assert_eq!(scan(&path, true).unwrap(), incoming);
+        let c = &e.registry.collections["test"];
+        assert!(c.directory && c.pending.is_none() && c.error.is_none());
+        assert_eq!(c.base, "directory-revision");
+    }
+    #[test]
+    fn empty_remote_directory_is_created_at_missing_destination() {
+        let t = Temp::new();
+        let mut e = t.engine();
+        let path = t.0.join("missing");
+        add(&mut e, "test", path.clone());
+        e.remote = Some(remote(
+            &e,
+            "test",
+            "empty-directory",
+            "",
+            Snapshot {
+                directory: true,
+                ..Default::default()
+            },
+        ));
+        e.tick("test").unwrap();
+        assert!(path.is_dir());
+        assert_eq!(e.registry.collections["test"].base, "empty-directory");
+    }
+    #[test]
+    fn established_file_type_is_not_changed_when_replaced_by_a_directory() {
+        let t = Temp::new();
+        let mut e = t.engine();
+        let path = t.0.join("config");
+        fs::write(&path, "").unwrap();
+        add(&mut e, "test", path.clone());
+        e.registry.collections.get_mut("test").unwrap().base = "published-file".into();
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(e.tick("test").is_err());
+        assert!(!e.registry.collections["test"].directory);
+    }
+    #[test]
+    fn existing_file_is_not_reinterpreted_as_a_remote_directory() {
+        let t = Temp::new();
+        let mut e = t.engine();
+        let path = t.0.join("config");
+        fs::write(&path, "").unwrap();
+        add(&mut e, "test", path.clone());
+        e.remote = Some(remote(
+            &e,
+            "test",
+            "directory",
+            "",
+            Snapshot {
+                directory: true,
+                ..Default::default()
+            },
+        ));
+        assert!(e.tick("test").is_err());
+        assert!(path.is_file());
     }
     include!("files_live_tests.rs");
 }

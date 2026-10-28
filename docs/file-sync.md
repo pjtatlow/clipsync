@@ -35,7 +35,9 @@ clipsync files add lazygit ~/.config/lazygit/config.yml
 
 Use the **same collection name** on every machine, with the local destination appropriate
 for that machine. Each collection maps to exactly one file or directory. Existing directories
-are detected automatically. To register a directory that does not exist yet:
+are detected automatically. If a path does not exist yet, ClipSync infers its type from
+the remote collection or waits for the local file/directory to appear. It does not publish
+an empty file while the type is unknown. To declare a new missing directory immediately:
 
 ```sh
 clipsync files add neovim ~/.config/nvim --directory
