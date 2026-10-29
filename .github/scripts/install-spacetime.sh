@@ -24,5 +24,8 @@ curl --fail --location --silent --show-error --retry 3 --retry-all-errors \
 tar -xzf "$cli_dir/cli.tar.gz" -C "$cli_dir" spacetimedb-cli spacetimedb-standalone
 chmod +x "$cli_dir/spacetimedb-cli" "$cli_dir/spacetimedb-standalone"
 ln -sf "$cli_dir/spacetimedb-cli" "$HOME/.local/bin/spacetime"
+# macOS resolves the standalone schema helper relative to the invoked CLI path.
+ln -sf "$cli_dir/spacetimedb-standalone" "$HOME/.local/bin/spacetimedb-standalone"
 echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-"$cli_dir/spacetimedb-cli" --version
+"$HOME/.local/bin/spacetime" --version
+"$HOME/.local/bin/spacetimedb-standalone" --version
