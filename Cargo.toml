@@ -3,7 +3,7 @@ exclude = ["server"]
 
 [package]
 name = "clipsync"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2024"
 description = "Encrypted clipboard and configuration sync across machines using SpacetimeDB"
 license = "MIT"

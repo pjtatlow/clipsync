@@ -22,6 +22,58 @@ Use a build of this client on every participating machine, run `clipsync setup` 
 same account on each, and restart the daemon. This is an additive schema update; do not
 use `--delete-data` on an existing database. Publishing/deployment is separate from building.
 
+## Initialize a new computer
+
+Upgrade to ClipSync 0.7.0 or later and restart the daemon on existing configured computers
+first. The daemon automatically publishes an encrypted default destination for each managed
+collection inside its home directory, even when the file contents have not changed. Wait
+for any pending destination metadata shown by `files status` to finish syncing.
+
+On the new computer, install ClipSync, log in to the same account, and start the daemon:
+
+```sh
+clipsync setup YOUR_USERNAME
+clipsync install
+clipsync files bootstrap --dry-run
+clipsync files bootstrap
+```
+
+Bootstrap discovers the saved collections, creates missing directories, installs their
+current contents, and registers them for ongoing sync. Paths are relative to the new
+computer's home directory; it never copies another machine's absolute home path.
+Already registered collections retain their local destination and are skipped by default,
+so repeating the command is safe.
+
+Differing existing configs are backed up in encrypted Git history, registered, and left
+in conflict without changing their live files. Resolve a collection individually with
+`clipsync files resolve NAME remote`, or explicitly back up and replace selected configs:
+
+```sh
+clipsync files bootstrap --replace
+clipsync files bootstrap --only rex --replace
+```
+
+Use `--only NAME` repeatedly to select collections, and `--map NAME=PATH` to override
+local destinations (including platform-specific paths):
+
+```sh
+clipsync files bootstrap --only rex --map 'rex=~/custom/rex'
+```
+
+The first advertised home-relative destination is the shared default. Mapping a different
+path on another computer does not change that default. Paths outside the source home
+have no automatic destination; supply `--map` to initialize them. Collections from older
+source clients also need an explicit mapping until an upgraded source daemon advertises
+their destination. Missing destinations are reported and skipped, never guessed.
+
+Destination paths are encrypted and authenticated using the same account key and
+protocol as file contents. Separate reserved metadata streams (`__clipsync_destination_*`)
+avoid collisions between independently registered collections. They are excluded from
+bootstrap's user collection list. No server schema update is required, and older clients
+continue syncing their registered files normally. Bootstrap validates all planned paths
+and snapshots before registration; application still uses the normal per-collection
+backups and recovery journals. Apps may need a reload after installation.
+
 ## Register collections
 
 Run these commands while the daemon is running:
@@ -158,7 +210,7 @@ cargo test live_two_device -- --ignored --nocapture
 ```
 
 `CLIPSYNC_TEST_SERVER` and `CLIPSYNC_TEST_DATABASE` override the test target. The test uses
-two authenticated device connections and isolated temporary directories; it verifies
+three authenticated device connections and isolated temporary directories; it verifies
 publication, encrypted installation, simultaneous edit conflicts, explicit resolution,
 rollback, Git content and per-device acknowledgements. The account/database used by the
 test must be disposable. The first test account is created without an invite only on a
@@ -197,8 +249,9 @@ cargo test live_two_device -- --ignored --nocapture
 ```
 
 This reads the local ClipSync login token and encryption identity without changing local
-configuration or touching managed destination paths. Two temporary device registrations
-and a unique `test-<UUID>` collection exercise encrypted sync, conflicts, resolution and
-rollback. On success the test unregisters its devices. The small encrypted test collection
-and its acknowledgements remain in server history; existing clients do not manage it
-unless explicitly registered. The test does not modify the clipboard.
+configuration or touching managed destination paths. Three temporary device registrations
+and unique `test-<UUID>` collections exercise encrypted sync, conflicts, resolution and
+rollback, encrypted destination publication and new-computer bootstrap. On success the
+test unregisters its devices and clears portable destinations for its temporary collections,
+so future bootstraps do not install them. Their encrypted history and acknowledgements
+remain on the server; they require explicit mappings to bootstrap. The test does not modify the clipboard.

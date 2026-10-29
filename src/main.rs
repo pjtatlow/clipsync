@@ -119,6 +119,20 @@ async fn main() -> anyhow::Result<()> {
                     },
                     directory,
                 },
+                files::FileCommand::Bootstrap {
+                    dry_run,
+                    replace,
+                    only,
+                    mappings,
+                } => {
+                    let mappings = files::normalize_mappings(mappings)?;
+                    files::FileCommand::Bootstrap {
+                        dry_run,
+                        replace,
+                        only,
+                        mappings,
+                    }
+                }
                 other => other,
             };
             match cli::send_request(protocol::Request::Files { command }).await? {

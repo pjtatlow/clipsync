@@ -14,11 +14,30 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod bootstrap;
+
+const DESTINATION_PREFIX: &str = "__clipsync_destination_";
+
 const MAX_BYTES: usize = 4 * 1024 * 1024;
 const MAX_FILES: usize = 2048;
 
 #[derive(Debug, Clone, Serialize, Deserialize, clap::Subcommand)]
 pub enum FileCommand {
+    /// Install synced collections on this computer using their saved destinations.
+    Bootstrap {
+        /// Preview destinations and actions without registering or installing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Replace differing local configs after saving encrypted Git backups.
+        #[arg(long)]
+        replace: bool,
+        /// Limit setup to a collection (repeat for multiple collections).
+        #[arg(long, value_name = "NAME")]
+        only: Vec<String>,
+        /// Override a local destination (repeat for multiple collections).
+        #[arg(long = "map", value_name = "NAME=PATH")]
+        mappings: Vec<String>,
+    },
     /// Register a file or directory. Existing remote content is never silently adopted.
     Add {
         name: String,
@@ -173,6 +192,15 @@ struct Collection {
 #[derive(Default, Serialize, Deserialize)]
 struct Registry {
     collections: BTreeMap<String, Collection>,
+    #[serde(default)]
+    destinations: BTreeMap<String, Pending>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Destination {
+    version: u32,
+    collection: String,
+    home_relative: Option<String>,
 }
 
 pub struct RemoteState {
@@ -221,6 +249,7 @@ pub fn spawn(
         .name("file-sync".into())
         .spawn(move || {
             let mut last_tick = Instant::now() - Duration::from_secs(1);
+            let mut destination_error = None;
             loop {
                 match rx.recv_timeout(Duration::from_millis(100)) {
                     Ok(req) => {
@@ -232,6 +261,18 @@ pub fn spawn(
                 }
                 if last_tick.elapsed() >= Duration::from_millis(300) {
                     engine.refresh();
+                    if let Some(home) = dirs::home_dir() {
+                        let error = engine
+                            .publish_destinations(&home)
+                            .err()
+                            .map(|e| format!("{e:#}"));
+                        if error != destination_error {
+                            if let Some(message) = &error {
+                                tracing::warn!("Destination sync: {message}");
+                            }
+                            destination_error = error;
+                        }
+                    }
                     let names: Vec<_> = engine.registry.collections.keys().cloned().collect();
                     for name in names {
                         if let Err(e) = engine.tick(&name) {
@@ -666,11 +707,24 @@ impl Engine {
     }
     fn command(&mut self, command: FileCommand) -> Result<String> {
         match command {
+            FileCommand::Bootstrap {
+                dry_run,
+                replace,
+                only,
+                mappings,
+            } => {
+                self.refresh();
+                let home = dirs::home_dir().context("Could not determine home directory")?;
+                self.bootstrap(&home, dry_run, replace, &only, &mappings)
+            }
             FileCommand::Add {
                 name,
                 path,
                 directory,
             } => {
+                if name.starts_with(DESTINATION_PREFIX) {
+                    bail!("This collection name is reserved for destination metadata");
+                }
                 if name.is_empty()
                     || name.len() > 64
                     || !name
@@ -683,18 +737,7 @@ impl Engine {
                     bail!("Collection already registered");
                 }
                 let path = absolute_path(&path)?;
-                reject_symlinks(&path)?;
-                if path.starts_with(&self.root) || self.root.starts_with(&path) {
-                    bail!("Cannot manage ClipSync's own state");
-                }
-                if self
-                    .registry
-                    .collections
-                    .values()
-                    .any(|c| path.starts_with(&c.path) || c.path.starts_with(&path))
-                {
-                    bail!("Collection paths must not overlap");
-                }
+                self.validate_new_path(&path)?;
                 let directory = directory || path.is_dir();
                 let snapshot = scan(&path, directory)?;
                 self.record(&name, &snapshot, "initial local backup")?;
@@ -747,6 +790,12 @@ impl Engine {
                         "offline (local changes are retained)"
                     }
                 );
+                if !self.registry.destinations.is_empty() {
+                    out.push_str(&format!(
+                        "Destination metadata awaiting sync: {}\n",
+                        self.registry.destinations.len()
+                    ));
+                }
                 for (name, c) in &self.registry.collections {
                     out.push_str(&format!(
                         "{name}: {}\n  applied: {}\n  path: {}\n",
@@ -903,6 +952,31 @@ impl Engine {
             .get(name)
             .context("Unknown collection")
     }
+}
+
+/// Resolve overrides in the CLI's working directory before sending them to the daemon.
+pub fn normalize_mappings(mappings: Vec<String>) -> Result<Vec<String>> {
+    mappings
+        .into_iter()
+        .map(|mapping| {
+            let (name, value) = mapping.split_once('=').context("Use --map NAME=PATH")?;
+            if name.is_empty() || value.is_empty() {
+                bail!("Use --map NAME=PATH");
+            }
+            let path = if let Some(relative) = value.strip_prefix("~/") {
+                dirs::home_dir()
+                    .context("Could not determine home directory")?
+                    .join(relative)
+            } else {
+                PathBuf::from(value)
+            };
+            let path = absolute_path(&path)?;
+            Ok(format!(
+                "{name}={}",
+                path.to_str().context("Destination must be UTF-8")?
+            ))
+        })
+        .collect()
 }
 
 fn safe_relative(path: &str) -> Result<()> {
@@ -1677,5 +1751,6 @@ mod tests {
         assert!(e.tick("test").is_err());
         assert!(path.is_file());
     }
+    include!("files/bootstrap_tests.rs");
     include!("files_live_tests.rs");
 }

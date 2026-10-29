@@ -250,7 +250,124 @@ fn live_two_device_sync_conflict_resolution_and_rollback() {
     });
     assert!(b.registry.collections[&directory_name].directory);
     assert!(b.registry.collections[&directory_name].error.is_none());
-    for (conn, device) in [(conn1, a.device.clone()), (conn2, b.device.clone())] {
+    // An upgraded source advertises encrypted, home-relative destinations. A fresh
+    // third device can discover and initialize both collections in one operation.
+    wait(|| {
+        a.refresh();
+        a.publish_destinations(&temp1.0).unwrap();
+        !a.head(&super::bootstrap::destination_collection(&name))
+            .is_empty()
+            && !a
+                .head(&super::bootstrap::destination_collection(&directory_name))
+                .is_empty()
+    });
+    let temp3 = Temp::new();
+    let mut c = temp3.engine();
+    c.identity = a.identity.to_string().expose_secret().parse().unwrap();
+    c.device = format!("device-bootstrap-{}", uuid::Uuid::new_v4());
+    let (tx3, _events3, conn3) = connect(&c.device, &server, &database);
+    c.tx = tx3;
+    wait(|| {
+        c.refresh();
+        c.remote.is_some()
+    });
+    let home = temp3.0.join("new-home");
+    let selected = vec![name.clone(), directory_name.clone()];
+    let preview = c.bootstrap(&home, true, false, &selected, &[]).unwrap();
+    assert!(preview.contains("Preview only"));
+    assert!(!home.exists());
+    let result = c.bootstrap(&home, false, false, &selected, &[]).unwrap();
+    assert!(result.contains("Installed/adopted 2"));
+    assert_eq!(c.registry.collections.len(), 2);
+    assert_eq!(
+        fs::read_to_string(home.join("config")).unwrap(),
+        "initial\n"
+    );
+    assert_eq!(
+        fs::read_to_string(home.join("rex/init.lua")).unwrap(),
+        "return {}\n"
+    );
+    wait(|| {
+        c.refresh();
+        for collection in &selected {
+            c.tick(collection).unwrap();
+        }
+        a.refresh();
+        a.remote.as_ref().is_some_and(|r| {
+            selected.iter().all(|collection| {
+                r.applied.iter().any(|ack| {
+                    ack.device_id == c.device
+                        && ack.collection == *collection
+                        && ack.revision == c.registry.collections[collection].base
+                })
+            })
+        })
+    });
+    // Retained test revisions must never be auto-installed on a real new machine.
+    // Clear portable destinations for these UUID-named fixture collections,
+    // including leftovers from earlier runs; content history stays encrypted.
+    a.refresh();
+    let metadata_heads: Vec<_> = a
+        .remote
+        .as_ref()
+        .unwrap()
+        .heads
+        .iter()
+        .filter(|h| h.collection.starts_with(DESTINATION_PREFIX))
+        .cloned()
+        .collect();
+    let mut cleared = 0;
+    for head in metadata_heads {
+        let mut metadata = a.decode(&head.collection, &head.revision).unwrap();
+        let entry = metadata.entries.get_mut("file").unwrap();
+        let mut destination: Destination = serde_json::from_slice(&entry.data).unwrap();
+        let suffix = destination
+            .collection
+            .strip_prefix("test-directory-")
+            .or_else(|| destination.collection.strip_prefix("test-"));
+        if suffix.is_none_or(|id| uuid::Uuid::parse_str(id).is_err())
+            || !matches!(destination.home_relative.as_deref(), Some("config" | "rex"))
+            || super::bootstrap::destination_collection(&destination.collection) != head.collection
+        {
+            continue;
+        }
+        destination.home_relative = None;
+        entry.data = serde_json::to_vec(&destination).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let encrypted = seal(
+            &a.identity,
+            Envelope {
+                version: 1,
+                collection: head.collection.clone(),
+                id: id.clone(),
+                parent: head.revision.clone(),
+                snapshot: metadata,
+            },
+        )
+        .unwrap();
+        wait(|| {
+            a.refresh();
+            if a.head(&head.collection) == id {
+                return true;
+            }
+            a.tx.send(SpacetimeCommand::PublishFile {
+                collection: head.collection.clone(),
+                expected: head.revision.clone(),
+                revision: id.clone(),
+                device_id: a.device.clone(),
+                encrypted_data: encrypted.clone(),
+            })
+            .unwrap();
+            false
+        });
+        cleared += 1;
+    }
+    eprintln!("Cleared portable bootstrap destinations for {cleared} test collections");
+    for (conn, device) in [
+        (conn1, a.device.clone()),
+        (conn2, b.device.clone()),
+        (conn3, c.device.clone()),
+    ] {
         let (tx, rx) = std::sync::mpsc::channel();
         conn.reducers
             .unregister_device_then(device, move |_, result| {
