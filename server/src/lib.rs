@@ -709,3 +709,68 @@ fn my_file_applied(ctx: &ViewContext) -> Vec<FileApplied> {
         .filter(&ui.user_id)
         .collect()
 }
+
+/// Delete an account's remote collection and its encrypted destination metadata.
+/// The expected head prevents deleting data that changed since the caller reviewed it.
+/// Local files and local Git backups on registered devices are not modified.
+#[reducer]
+pub fn delete_file_collection(
+    ctx: &ReducerContext,
+    collection: String,
+    expected_revision: String,
+) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    let user_id = get_user_id(ctx)?;
+    if collection.is_empty()
+        || collection.len() > 64
+        || collection.starts_with("__clipsync_destination_")
+        || !collection
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err("Invalid collection name".into());
+    }
+    let key = format!("{user_id}:{collection}");
+    let head = ctx
+        .db
+        .file_head()
+        .key()
+        .find(&key)
+        .ok_or("Collection does not exist")?;
+    if head.revision != expected_revision {
+        return Err("Collection changed; refresh before deleting".into());
+    }
+    let metadata = format!(
+        "__clipsync_destination_{:.32}",
+        format!("{:x}", Sha256::digest(collection.as_bytes()))
+    );
+    for name in [&collection, &metadata] {
+        let revisions: Vec<_> = ctx
+            .db
+            .file_revision()
+            .user_id()
+            .filter(&user_id)
+            .filter(|r| &r.collection == name)
+            .map(|r| r.id)
+            .collect();
+        for id in revisions {
+            ctx.db.file_revision().id().delete(&id);
+        }
+        let acknowledgements: Vec<_> = ctx
+            .db
+            .file_applied()
+            .user_id()
+            .filter(&user_id)
+            .filter(|r| &r.collection == name)
+            .map(|r| r.key)
+            .collect();
+        for key in acknowledgements {
+            ctx.db.file_applied().key().delete(&key);
+        }
+        ctx.db
+            .file_head()
+            .key()
+            .delete(&format!("{user_id}:{name}"));
+    }
+    Ok(())
+}

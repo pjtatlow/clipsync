@@ -51,19 +51,16 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v7
         with:
           name: server-wasm
           path: module
       - name: Install SpacetimeDB CLI
         shell: bash
-        run: |
-          curl --fail --silent --show-error https://install.spacetimedb.com -o "$RUNNER_TEMP/install-spacetime.sh"
-          bash "$RUNNER_TEMP/install-spacetime.sh" -y
-          export PATH="$HOME/.local/bin:$PATH"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          spacetime version install 2.0.5
-          spacetime version use 2.0.5
+        run: bash .github/scripts/install-spacetime.sh
       - name: Authenticate deployment account
         env:
           SPACETIME_TOKEN: ${{ secrets.SPACETIME_TOKEN }}

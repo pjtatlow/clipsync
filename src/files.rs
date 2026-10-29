@@ -1751,6 +1751,7 @@ mod tests {
         assert!(e.tick("test").is_err());
         assert!(path.is_file());
     }
+    include!("files/cleanup_tests.rs");
     include!("files/bootstrap_tests.rs");
     include!("files_live_tests.rs");
 }

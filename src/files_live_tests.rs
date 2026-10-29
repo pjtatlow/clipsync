@@ -303,66 +303,56 @@ fn live_two_device_sync_conflict_resolution_and_rollback() {
             })
         })
     });
-    // Retained test revisions must never be auto-installed on a real new machine.
-    // Clear portable destinations for these UUID-named fixture collections,
-    // including leftovers from earlier runs; content history stays encrypted.
-    a.refresh();
-    let metadata_heads: Vec<_> = a
-        .remote
-        .as_ref()
-        .unwrap()
-        .heads
-        .iter()
-        .filter(|h| h.collection.starts_with(DESTINATION_PREFIX))
-        .cloned()
-        .collect();
-    let mut cleared = 0;
-    for head in metadata_heads {
-        let mut metadata = a.decode(&head.collection, &head.revision).unwrap();
-        let entry = metadata.entries.get_mut("file").unwrap();
-        let mut destination: Destination = serde_json::from_slice(&entry.data).unwrap();
-        let suffix = destination
-            .collection
-            .strip_prefix("test-directory-")
-            .or_else(|| destination.collection.strip_prefix("test-"));
-        if suffix.is_none_or(|id| uuid::Uuid::parse_str(id).is_err())
-            || !matches!(destination.home_relative.as_deref(), Some("config" | "rex"))
-            || super::bootstrap::destination_collection(&destination.collection) != head.collection
-        {
-            continue;
-        }
-        destination.home_relative = None;
-        entry.data = serde_json::to_vec(&destination).unwrap();
-        let id = uuid::Uuid::new_v4().to_string();
-        let encrypted = seal(
-            &a.identity,
-            Envelope {
-                version: 1,
-                collection: head.collection.clone(),
-                id: id.clone(),
-                parent: head.revision.clone(),
-                snapshot: metadata,
-            },
-        )
+    // Delete fixture heads, encrypted history, acknowledgements and destinations,
+    // rather than leaving test collections visible in bootstrap previews.
+    // A stale reviewed head must not delete a collection.
+    let (guard_tx, guard_rx) = std::sync::mpsc::channel();
+    conn1
+        .reducers
+        .delete_file_collection_then(name.clone(), "stale-review".into(), move |_, result| {
+            let _ = guard_tx.send(result);
+        })
         .unwrap();
-        wait(|| {
-            a.refresh();
-            if a.head(&head.collection) == id {
-                return true;
-            }
-            a.tx.send(SpacetimeCommand::PublishFile {
-                collection: head.collection.clone(),
-                expected: head.revision.clone(),
-                revision: id.clone(),
-                device_id: a.device.clone(),
-                encrypted_data: encrypted.clone(),
+    assert!(
+        guard_rx
+            .recv_timeout(Duration::from_secs(15))
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
+    a.refresh();
+    assert!(!a.head(&name).is_empty());
+    for collection in &selected {
+        a.refresh();
+        let expected = a.head(collection);
+        let (tx, rx) = std::sync::mpsc::channel();
+        conn1
+            .reducers
+            .delete_file_collection_then(collection.clone(), expected, move |_, result| {
+                let _ = tx.send(result);
             })
             .unwrap();
-            false
-        });
-        cleared += 1;
+        rx.recv_timeout(Duration::from_secs(15))
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
-    eprintln!("Cleared portable bootstrap destinations for {cleared} test collections");
+    wait(|| {
+        a.refresh();
+        selected.iter().all(|collection| {
+            a.head(collection).is_empty()
+                && a.head(&super::bootstrap::destination_collection(collection))
+                    .is_empty()
+                && !a
+                    .remote
+                    .as_ref()
+                    .unwrap()
+                    .revisions
+                    .iter()
+                    .any(|r| r.collection == *collection)
+        })
+    });
+    eprintln!("Removed both temporary test collections and their destination metadata");
     for (conn, device) in [
         (conn1, a.device.clone()),
         (conn2, b.device.clone()),
