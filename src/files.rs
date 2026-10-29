@@ -6,7 +6,7 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::Write,
     path::{Component, Path, PathBuf},
@@ -15,6 +15,7 @@ use std::{
 };
 
 mod bootstrap;
+mod discovery;
 
 const DESTINATION_PREFIX: &str = "__clipsync_destination_";
 
@@ -46,7 +47,7 @@ pub enum FileCommand {
         #[arg(long)]
         directory: bool,
     },
-    /// Stop managing a collection, keeping destination files and Git backups.
+    /// Stop watching or auto-adding a collection here, keeping files and backups.
     Remove { name: String },
     /// Show local progress and each device's last installed revision.
     Status,
@@ -105,6 +106,17 @@ impl Snapshot {
                     && self.entries.contains_key(p)
                 {
                     bail!("Conflicting file paths");
+                }
+                parent = p.parent();
+            }
+        }
+        for path in portable_paths.keys() {
+            let mut parent = Path::new(path).parent();
+            while let Some(p) = parent {
+                if let Some(p) = p.to_str()
+                    && portable_paths.contains_key(p)
+                {
+                    bail!("Conflicting portable file paths");
                 }
                 parent = p.parent();
             }
@@ -194,6 +206,8 @@ struct Registry {
     collections: BTreeMap<String, Collection>,
     #[serde(default)]
     destinations: BTreeMap<String, Pending>,
+    #[serde(default)]
+    ignored: BTreeSet<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -220,11 +234,15 @@ struct Engine {
     tx: crossbeam_channel::Sender<SpacetimeCommand>,
     remote: Option<RemoteState>,
     observed: BTreeMap<String, (String, Instant)>,
+    auto_add_collections: bool,
+    discovery: BTreeMap<String, String>,
+    discovery_snapshots: BTreeMap<String, (String, Snapshot)>,
 }
 
 pub fn spawn(
     device: String,
     tx: crossbeam_channel::Sender<SpacetimeCommand>,
+    auto_add_collections: bool,
 ) -> Result<std::sync::mpsc::Sender<FileRequest>> {
     let root = config::ensure_config_dir()?.join("files");
     private_dir(&root)?;
@@ -244,6 +262,9 @@ pub fn spawn(
         tx,
         remote: None,
         observed: BTreeMap::new(),
+        auto_add_collections,
+        discovery: BTreeMap::new(),
+        discovery_snapshots: BTreeMap::new(),
     };
     std::thread::Builder::new()
         .name("file-sync".into())
@@ -272,6 +293,7 @@ pub fn spawn(
                             }
                             destination_error = error;
                         }
+                        engine.discover_collections(&home, &[]);
                     }
                     let names: Vec<_> = engine.registry.collections.keys().cloned().collect();
                     for name in names {
@@ -741,6 +763,7 @@ impl Engine {
                 let directory = directory || path.is_dir();
                 let snapshot = scan(&path, directory)?;
                 self.record(&name, &snapshot, "initial local backup")?;
+                let was_ignored = self.registry.ignored.remove(&name);
                 // Empty baseline makes a joining device with existing differing data conflict safely.
                 self.registry.collections.insert(
                     name.clone(),
@@ -760,25 +783,40 @@ impl Engine {
                 );
                 if let Err(error) = self.save() {
                     self.registry.collections.remove(&name);
+                    if was_ignored {
+                        self.registry.ignored.insert(name);
+                    }
                     return Err(error);
                 }
+                self.discovery.remove(&name);
+                self.discovery_snapshots.remove(&name);
                 Ok(format!(
                     "Registered {name}. Sync starts automatically; existing remote differences require resolution."
                 ))
             }
             FileCommand::Remove { name } => {
-                let previous = self
-                    .registry
-                    .collections
-                    .remove(&name)
-                    .context("Unknown collection")?;
+                let previous = self.registry.collections.remove(&name);
+                if previous.is_none()
+                    && self.head(&name).is_empty()
+                    && !self.registry.ignored.contains(&name)
+                {
+                    bail!("Unknown collection");
+                }
+                let already_ignored = !self.registry.ignored.insert(name.clone());
                 if let Err(error) = self.save() {
-                    self.registry.collections.insert(name, previous);
+                    if !already_ignored {
+                        self.registry.ignored.remove(&name);
+                    }
+                    if let Some(previous) = previous {
+                        self.registry.collections.insert(name, previous);
+                    }
                     return Err(error);
                 }
                 self.observed.remove(&name);
+                self.discovery.remove(&name);
+                self.discovery_snapshots.remove(&name);
                 Ok(format!(
-                    "Stopped managing {name}. Destination files, Git backups and server history are retained."
+                    "Stopped managing {name} on this computer; automatic enrollment is disabled for it. Destination files, Git backups and server history are retained."
                 ))
             }
             FileCommand::Status => {
@@ -790,6 +828,10 @@ impl Engine {
                         "offline (local changes are retained)"
                     }
                 );
+                out.push_str(&format!(
+                    "Auto-add new collections: {}\n",
+                    self.auto_add_collections
+                ));
                 if !self.registry.destinations.is_empty() {
                     out.push_str(&format!(
                         "Destination metadata awaiting sync: {}\n",
@@ -830,6 +872,20 @@ impl Engine {
                             ));
                         }
                     }
+                }
+                for (name, reason) in &self.discovery {
+                    out.push_str(&format!("Not watching {name}: {reason}\n"));
+                }
+                if !self.registry.ignored.is_empty() {
+                    out.push_str(&format!(
+                        "Locally excluded: {}\n",
+                        self.registry
+                            .ignored
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
                 }
                 Ok(out)
             }
@@ -977,6 +1033,13 @@ pub fn normalize_mappings(mappings: Vec<String>) -> Result<Vec<String>> {
             ))
         })
         .collect()
+}
+
+/// Keep collection roots portable across case-insensitive and case-sensitive hosts.
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    let left = PathBuf::from(left.to_string_lossy().to_lowercase());
+    let right = PathBuf::from(right.to_string_lossy().to_lowercase());
+    left.starts_with(&right) || right.starts_with(&left)
 }
 
 fn safe_relative(path: &str) -> Result<()> {
@@ -1131,14 +1194,7 @@ fn atomic_write(path: &Path, data: &[u8], executable: bool) -> Result<()> {
     }
     result
 }
-fn install(root: &Path, before: &Snapshot, after: &Snapshot) -> Result<()> {
-    if before.directory != after.directory {
-        bail!("Snapshot type mismatch");
-    }
-    after.validate()?;
-    if scan(root, before.directory)? != *before {
-        bail!("Local files changed before application");
-    }
+fn validate_install_paths(root: &Path, before: &Snapshot, after: &Snapshot) -> Result<()> {
     // Preflight path/type collisions before writing anything. File/directory transitions
     // deliberately require manual handling in v1.
     for key in before.entries.keys().chain(after.entries.keys()) {
@@ -1153,6 +1209,18 @@ fn install(root: &Path, before: &Snapshot, after: &Snapshot) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+fn install(root: &Path, before: &Snapshot, after: &Snapshot) -> Result<()> {
+    if before.directory != after.directory {
+        bail!("Snapshot type mismatch");
+    }
+    after.validate()?;
+    if scan(root, before.directory)? != *before {
+        bail!("Local files changed before application");
+    }
+    validate_install_paths(root, before, after)?;
     if after.directory && !root.exists() {
         reject_symlinks(root)?;
         fs::create_dir_all(root)?;
@@ -1239,6 +1307,9 @@ mod tests {
                 tx,
                 remote: None,
                 observed: BTreeMap::new(),
+                auto_add_collections: true,
+                discovery: BTreeMap::new(),
+                discovery_snapshots: BTreeMap::new(),
             }
         }
     }
@@ -1753,5 +1824,6 @@ mod tests {
     }
     include!("files/cleanup_tests.rs");
     include!("files/bootstrap_tests.rs");
+    include!("files/discovery_tests.rs");
     include!("files_live_tests.rs");
 }

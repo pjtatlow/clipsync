@@ -31,7 +31,7 @@ impl Engine {
         let config = config::config_dir()?;
         if [&self.root, &config]
             .into_iter()
-            .any(|state| path.starts_with(state) || state.starts_with(path))
+            .any(|state| paths_overlap(path, state))
         {
             bail!("Cannot manage ClipSync's own state");
         }
@@ -39,14 +39,14 @@ impl Engine {
             .registry
             .collections
             .values()
-            .any(|c| path.starts_with(&c.path) || c.path.starts_with(path))
+            .any(|c| paths_overlap(path, &c.path))
         {
             bail!("Collection paths must not overlap: {}", path.display());
         }
         Ok(())
     }
 
-    fn destination(&self, name: &str) -> Result<Option<Destination>> {
+    pub(super) fn destination(&self, name: &str) -> Result<Option<Destination>> {
         let metadata = destination_collection(name);
         let head = self.head(&metadata);
         if head.is_empty() {
@@ -93,9 +93,12 @@ impl Engine {
                 continue;
             }
             let path = &self.registry.collections[&name].path;
-            let Some(relative) = path
+            let relative_path = path
                 .strip_prefix(home)
                 .ok()
+                .map(|path| path.components().collect::<PathBuf>());
+            let Some(relative) = relative_path
+                .as_ref()
                 .and_then(|p| p.to_str())
                 .filter(|s| !s.is_empty())
             else {
@@ -207,6 +210,15 @@ impl Engine {
             if !only.is_empty() && !only.contains(&name) {
                 continue;
             }
+            if self.registry.ignored.contains(&name)
+                && only.is_empty()
+                && !overrides.contains_key(&name)
+            {
+                output.push_str(&format!(
+                    "skip {name}: locally excluded; use --only {name} to re-enable\n"
+                ));
+                continue;
+            }
             let registered = self.registry.collections.get(&name);
             let path = if let Some(path) = overrides.remove(&name) {
                 if registered.is_some_and(|c| c.path != path) {
@@ -234,10 +246,7 @@ impl Engine {
             if registered.is_none() {
                 self.validate_new_path(&path)?;
             }
-            if plan
-                .iter()
-                .any(|other| path.starts_with(&other.path) || other.path.starts_with(&path))
-            {
+            if plan.iter().any(|other| paths_overlap(&path, &other.path)) {
                 bail!("Bootstrap destinations overlap at {}", path.display());
             }
             self.verify_descendant(
@@ -254,6 +263,7 @@ impl Engine {
             }
             let local = scan(&path, snapshot.directory)?;
             validate_shell(&snapshot, &path)?;
+            validate_install_paths(&path, &local, &snapshot)?;
             let conflict = !replace && !local.entries.is_empty() && local != snapshot;
             output.push_str(&format!(
                 "{} {name} -> {}\n",

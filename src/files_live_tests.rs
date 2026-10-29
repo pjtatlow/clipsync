@@ -1,9 +1,9 @@
-// Defaults to a disposable database; local-account testing requires explicit opt-in.
+// Live mode uses the local admin only to invite a separate, isolated test account.
 #[test]
 #[ignore = "requires a local SpacetimeDB with the server module published"]
 fn live_two_device_sync_conflict_resolution_and_rollback() {
     use crate::module_bindings::*;
-    use spacetimedb_sdk::DbContext;
+    use spacetimedb_sdk::{DbContext, Table};
     use std::sync::Arc;
     fn wait(mut condition: impl FnMut() -> bool) {
         let start = Instant::now();
@@ -15,31 +15,77 @@ fn live_two_device_sync_conflict_resolution_and_rollback() {
             std::thread::sleep(Duration::from_millis(30));
         }
     }
+    struct TestLogin {
+        username: String,
+        password: String,
+        invite: String,
+        public_key: Vec<u8>,
+        encrypted_private_key: Vec<u8>,
+    }
+    fn invite_isolated_account(server: &str, database: &str) -> String {
+        let configured = config::Config::load().unwrap();
+        assert_eq!(
+            server, configured.server_url,
+            "Use the configured service for live tests"
+        );
+        assert_eq!(database, configured.database_name);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let owner = Arc::new(
+            DbConnection::builder()
+                .with_uri(server)
+                .with_database_name(database)
+                .with_token(config::load_token().unwrap())
+                .on_connect(move |conn, _, _| {
+                    conn.subscription_builder()
+                        .on_applied(move |_| {
+                            let _ = tx.send(());
+                        })
+                        .subscribe(["SELECT * FROM my_profile"]);
+                })
+                .build()
+                .unwrap(),
+        );
+        let _handle = owner.run_threaded();
+        rx.recv_timeout(Duration::from_secs(15)).unwrap();
+        assert!(
+            owner.db.my_profile().iter().any(|p| p.is_admin),
+            "Live tests need a local admin account to invite an isolated account"
+        );
+        let invite = format!(
+            "{}{}-AaBbCcDdEeFfGgHh",
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4()
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        owner
+            .reducers
+            .create_invite_code_then(invite.clone(), move |_, result| {
+                let _ = tx.send(result);
+            })
+            .unwrap();
+        rx.recv_timeout(Duration::from_secs(15))
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        owner.disconnect().unwrap();
+        invite
+    }
     fn connect(
         device: &str,
         server: &str,
         database: &str,
+        login: &TestLogin,
     ) -> (
         crossbeam_channel::Sender<SpacetimeCommand>,
         tokio::sync::mpsc::Receiver<crate::daemon::spacetime::SpacetimeEvent>,
         Arc<DbConnection>,
     ) {
-        let use_local = std::env::var("CLIPSYNC_TEST_USE_LOCAL_ACCOUNT").as_deref() == Ok("1");
-        let existing_token = if use_local {
-            Some(
-                config::load_token()
-                    .unwrap()
-                    .expect("Local account token required"),
-            )
-        } else {
-            None
-        };
         let (token_tx, token_rx) = std::sync::mpsc::channel();
         let conn = Arc::new(
             DbConnection::builder()
                 .with_uri(server)
                 .with_database_name(database)
-                .with_token(existing_token)
+                .with_token(None::<String>)
                 .on_connect(move |conn, _, token| {
                     let token = token.to_string();
                     conn.subscription_builder()
@@ -53,34 +99,36 @@ fn live_two_device_sync_conflict_resolution_and_rollback() {
         );
         let _handle = conn.run_threaded();
         let token = token_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(
+            conn.db.my_profile().iter().next().is_none(),
+            "Fixture connection must start anonymous; refusing to change an existing account identity"
+        );
         let (auth_tx, auth_rx) = std::sync::mpsc::channel();
-        if use_local {
-            conn.reducers
-                .register_device_then(device.into(), device.into(), move |_, result| {
-                    auth_tx.send(result.map_err(|e| format!("{e:?}"))).unwrap();
-                })
-                .unwrap();
-        } else {
-            conn.reducers
-                .authenticate_then(
-                    "file-integration-test".into(),
-                    "integration-password-only".into(),
-                    vec![],
-                    vec![],
-                    device.into(),
-                    device.into(),
-                    String::new(),
-                    move |_, result| {
-                        auth_tx.send(result.map_err(|e| format!("{e:?}"))).unwrap();
-                    },
-                )
-                .unwrap();
-        }
+        conn.reducers
+            .authenticate_then(
+                login.username.clone(),
+                login.password.clone(),
+                login.encrypted_private_key.clone(),
+                login.public_key.clone(),
+                device.into(),
+                device.into(),
+                login.invite.clone(),
+                move |_, result| {
+                    let _ = auth_tx.send(result.map_err(|e| format!("{e:?}")));
+                },
+            )
+            .unwrap();
         auth_rx
             .recv_timeout(Duration::from_secs(10))
             .unwrap()
             .unwrap()
             .unwrap();
+        wait(|| {
+            conn.db
+                .my_profile()
+                .iter()
+                .any(|profile| profile.username == login.username)
+        });
         let (events, rx) = tokio::sync::mpsc::channel(32);
         let (tx, commands) = crossbeam_channel::unbounded();
         let config = config::Config {
@@ -100,16 +148,38 @@ fn live_two_device_sync_conflict_resolution_and_rollback() {
     let mut b = temp2.engine();
     a.device = format!("device-a-{}", uuid::Uuid::new_v4());
     b.device = format!("device-b-{}", uuid::Uuid::new_v4());
-    // Both registered devices of an account use the same encryption identity.
-    if std::env::var("CLIPSYNC_TEST_USE_LOCAL_ACCOUNT").as_deref() == Ok("1") {
-        a.identity =
-            crypto::load_private_key().expect("Local account encryption identity required");
-    }
+    // All fixture data stays in a separate account in live mode. Real clients
+    // therefore cannot automatically enroll these temporary collections.
     use age::secrecy::ExposeSecret;
+    let live = std::env::var("CLIPSYNC_TEST_USE_LOCAL_ACCOUNT").as_deref() == Ok("1");
+    let password = if live {
+        format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4())
+    } else {
+        "integration-password-only".into()
+    };
+    let login = TestLogin {
+        username: if live {
+            format!("clipsync-test-{}", uuid::Uuid::new_v4())
+        } else {
+            "file-integration-test".into()
+        },
+        encrypted_private_key: crypto::encrypt_with_passphrase(
+            a.identity.to_string().expose_secret().as_bytes(),
+            &password,
+        )
+        .unwrap(),
+        public_key: crypto::public_key_bytes(&a.identity.to_public()),
+        password,
+        invite: if live {
+            invite_isolated_account(&server, &database)
+        } else {
+            String::new()
+        },
+    };
     b.identity = a.identity.to_string().expose_secret().parse().unwrap();
-    let (tx1, _events1, conn1) = connect(&a.device, &server, &database);
+    let (tx1, _events1, conn1) = connect(&a.device, &server, &database, &login);
     a.tx = tx1;
-    let (tx2, _events2, conn2) = connect(&b.device, &server, &database);
+    let (tx2, _events2, conn2) = connect(&b.device, &server, &database, &login);
     b.tx = tx2;
     let name = format!("test-{}", uuid::Uuid::new_v4());
     let path_a = temp1.0.join("config");
@@ -265,14 +335,14 @@ fn live_two_device_sync_conflict_resolution_and_rollback() {
     let mut c = temp3.engine();
     c.identity = a.identity.to_string().expose_secret().parse().unwrap();
     c.device = format!("device-bootstrap-{}", uuid::Uuid::new_v4());
-    let (tx3, _events3, conn3) = connect(&c.device, &server, &database);
+    let (tx3, _events3, conn3) = connect(&c.device, &server, &database, &login);
     c.tx = tx3;
     wait(|| {
         c.refresh();
         c.remote.is_some()
     });
     let home = temp3.0.join("new-home");
-    let selected = vec![name.clone(), directory_name.clone()];
+    let mut selected = vec![name.clone(), directory_name.clone()];
     let preview = c.bootstrap(&home, true, false, &selected, &[]).unwrap();
     assert!(preview.contains("Preview only"));
     assert!(!home.exists());
@@ -303,6 +373,49 @@ fn live_two_device_sync_conflict_resolution_and_rollback() {
             })
         })
     });
+    // A newly registered collection appears on the other device automatically,
+    // without another bootstrap. A different local file is left untouched.
+    for (relative, contents) in [
+        ("new-config", "new shared config"),
+        ("conflicting-config", "cloud config"),
+    ] {
+        let new_name = format!("test-{}", uuid::Uuid::new_v4());
+        let source = temp1.0.join(relative);
+        fs::write(&source, contents).unwrap();
+        add(&mut a, &new_name, source);
+        if relative == "conflicting-config" {
+            fs::write(home.join(relative), "keep my local config").unwrap();
+        }
+        a.queue(&new_name, snapshot(contents)).unwrap();
+        wait(|| {
+            a.refresh();
+            a.publish_destinations(&temp1.0).unwrap();
+            a.tick(&new_name).unwrap();
+            !a.registry.collections[&new_name].base.is_empty()
+                && !a
+                    .head(&super::bootstrap::destination_collection(&new_name))
+                    .is_empty()
+        });
+        wait(|| {
+            c.refresh();
+            c.discover_collections(&home, &[]);
+            if relative == "conflicting-config" {
+                c.discovery.contains_key(&new_name)
+            } else {
+                c.registry.collections.contains_key(&new_name)
+            }
+        });
+        if relative == "conflicting-config" {
+            assert!(!c.registry.collections.contains_key(&new_name));
+            assert_eq!(
+                fs::read_to_string(home.join(relative)).unwrap(),
+                "keep my local config"
+            );
+        } else {
+            assert_eq!(fs::read_to_string(home.join(relative)).unwrap(), contents);
+        }
+        selected.push(new_name);
+    }
     // Delete fixture heads, encrypted history, acknowledgements and destinations,
     // rather than leaving test collections visible in bootstrap previews.
     // A stale reviewed head must not delete a collection.
@@ -352,7 +465,7 @@ fn live_two_device_sync_conflict_resolution_and_rollback() {
                     .any(|r| r.collection == *collection)
         })
     });
-    eprintln!("Removed both temporary test collections and their destination metadata");
+    eprintln!("Removed temporary test collections and their destination metadata");
     for (conn, device) in [
         (conn1, a.device.clone()),
         (conn2, b.device.clone()),

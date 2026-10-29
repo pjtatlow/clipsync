@@ -22,6 +22,29 @@ Use a build of this client on every participating machine, run `clipsync setup` 
 same account on each, and restart the daemon. This is an additive schema update; do not
 use `--delete-data` on an existing database. Publishing/deployment is separate from building.
 
+## Automatic enrollment (0.8.0 and later)
+
+After a source registers a new collection with `files add`, other upgraded machines
+pick it up automatically using its encrypted saved destination. Missing destinations
+are installed; matching local contents are adopted. Existing different files, unsafe
+paths, overlapping roots and unavailable destinations are left untouched and listed as
+`Not watching NAME` in `clipsync files status`. Source clients need 0.7.0 or later to
+advertise paths; receiving clients need 0.8.0 or later for automatic enrollment.
+
+Automatic enrollment is enabled by default. To keep a computer in manual setup mode:
+
+```sh
+clipsync config auto_add_collections false
+clipsync restart
+```
+
+Existing watches keep syncing, including new files inside watched directories. Use
+`clipsync files remove NAME` to exclude just one collection locally, including a remote
+collection that has not been registered yet. Its files and cloud history remain intact,
+and it will not be automatically re-added. Explicit `files add`, or bootstrap with
+`--only NAME` or `--map NAME=PATH`, re-enables it. Ordinary bootstrap respects exclusions.
+Invalid config files now stop startup instead of silently enabling default settings.
+
 ## Initialize a new computer
 
 Upgrade to ClipSync 0.7.0 or later and restart the daemon on existing configured computers
@@ -34,9 +57,14 @@ On the new computer, install ClipSync, log in to the same account, and start the
 ```sh
 clipsync setup YOUR_USERNAME
 clipsync install
-clipsync files bootstrap --dry-run
-clipsync files bootstrap
+clipsync files status
 ```
+
+With automatic enrollment enabled, conflict-free configurations arrive without an
+additional bootstrap command. To review everything before installing, set
+`clipsync config auto_add_collections false` **before starting the daemon**, then run
+`files bootstrap --dry-run` followed by `files bootstrap`. A dry-run does not change
+files itself, but it does not pause a running auto-add daemon.
 
 Bootstrap discovers the saved collections, creates missing directories, installs their
 current contents, and registers them for ongoing sync. Paths are relative to the new
@@ -126,7 +154,8 @@ clipsync files rollback zsh COMMIT_HASH
 ```
 
 Status shows the transport subscription, local pending/error/conflict state, server head,
-and each device's last acknowledged installation. An acknowledgement means files were
+each device's last acknowledged installation, and advertised collections that could not
+be enrolled automatically. An acknowledgement means files were
 installed, not that a running application reloaded them. Device IDs are shown directly.
 
 History is a local Git audit log including captured revisions, pre-application backups,
@@ -167,7 +196,8 @@ it does not rewind the server head. Pending changes/conflicts must be resolved f
   can remain. File/directory type transitions require manual handling.
 - Each collection is limited to 4 MiB of file contents and 2,048 files. Paths must be UTF-8,
   relative inside the collection, free of traversal and control characters, and without
-  case-colliding file names. Destinations reject symlinks, including ancestor symlinks.
+  case-colliding file names or file/directory ancestors. Collection roots cannot overlap
+  or differ only by letter case. Destinations reject symlinks, including ancestor symlinks.
 - Revisions are compressed and encrypted with the existing age account identity. An
   additional HMAC proves possession of the account secret: knowing the public encryption
   key alone cannot authorize config installation. The authenticated payload binds the
@@ -248,10 +278,12 @@ CLIPSYNC_TEST_DATABASE=clipsync \
 cargo test live_two_device -- --ignored --nocapture
 ```
 
-This reads the local ClipSync login token and encryption identity without changing local
-configuration or touching managed destination paths. Three temporary device registrations
-and unique `test-<UUID>` collections exercise encrypted sync, conflicts, resolution and
-rollback, encrypted destination publication and new-computer bootstrap. On success the
-test unregisters its devices and clears portable destinations for its temporary collections,
-so future bootstraps do not install them. Their encrypted history and acknowledgements
-remain on the server; they require explicit mappings to bootstrap. The test does not modify the clipboard.
+This uses the locally configured **admin** account only to create a one-use invite for a
+separate, randomly named test account. Fixture connections start anonymously and log in
+to that isolated account; they never bind the normal account's identity to a test user.
+Three temporary device registrations exercise encrypted sync, conflicts, resolution,
+rollback, bootstrap and automatic enrollment of a newly added configuration. Existing
+different local files are checked for preservation. On success, fixtures, destination
+metadata, acknowledgements and device registrations are deleted. An empty isolated test
+account may remain, but no test collections are published into the normal account.
+The test does not modify the clipboard or existing managed configuration files.

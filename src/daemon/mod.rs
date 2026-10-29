@@ -52,7 +52,11 @@ pub async fn run_daemon(config: Config) -> Result<()> {
     let mut socket_handle = tokio::spawn(socket::run_socket_server(socket_req_tx));
 
     // File sync owns its durable registry and Git repositories on a separate actor thread.
-    let files_tx = crate::files::spawn(device_id.clone(), stdb_cmd_tx.clone())?;
+    let files_tx = crate::files::spawn(
+        device_id.clone(),
+        stdb_cmd_tx.clone(),
+        config.auto_add_collections,
+    )?;
 
     // State
     let mut connected = false;

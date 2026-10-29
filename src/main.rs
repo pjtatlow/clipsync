@@ -51,7 +51,7 @@ enum Command {
     Devices,
     /// Get or set config values
     Config {
-        /// Config key (watch_clipboard, poll_interval_ms, server_url, database_name)
+        /// Config key (watch_clipboard, auto_add_collections, poll_interval_ms, server_url, database_name)
         key: Option<String>,
         /// Value to set (omit to read current value)
         value: Option<String>,
@@ -94,7 +94,7 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .init();
 
-            let config = config::Config::load().unwrap_or_default();
+            let config = config::Config::load()?;
             daemon::run_daemon(config).await?;
         }
         Command::Setup {

@@ -21,6 +21,8 @@ pub fn ensure_config_dir() -> Result<PathBuf> {
 pub struct Config {
     #[serde(default = "default_watch_clipboard")]
     pub watch_clipboard: bool,
+    #[serde(default = "default_auto_add_collections")]
+    pub auto_add_collections: bool,
     #[serde(default = "default_poll_interval")]
     pub poll_interval_ms: u64,
     #[serde(default = "default_server_url")]
@@ -30,6 +32,10 @@ pub struct Config {
 }
 
 fn default_watch_clipboard() -> bool {
+    true
+}
+
+fn default_auto_add_collections() -> bool {
     true
 }
 
@@ -49,6 +55,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             watch_clipboard: true,
+            auto_add_collections: true,
             poll_interval_ms: default_poll_interval(),
             server_url: default_server_url(),
             database_name: default_database_name(),
@@ -146,8 +153,7 @@ fn user_id_path() -> Result<PathBuf> {
 pub fn load_user_id() -> Result<Option<u64>> {
     let path = user_id_path()?;
     if path.exists() {
-        let content = std::fs::read_to_string(&path)
-            .with_context(|| "Failed to read user_id")?;
+        let content = std::fs::read_to_string(&path).with_context(|| "Failed to read user_id")?;
         let id: u64 = content.trim().parse().context("Failed to parse user_id")?;
         Ok(Some(id))
     } else {
@@ -198,6 +204,7 @@ mod tests {
     fn config_round_trip() {
         let config = Config {
             watch_clipboard: true,
+            auto_add_collections: true,
             poll_interval_ms: 1000,
             server_url: "https://example.com".to_string(),
             database_name: "test".to_string(),
@@ -208,5 +215,12 @@ mod tests {
         assert_eq!(deserialized.poll_interval_ms, 1000);
         assert_eq!(deserialized.server_url, "https://example.com");
         assert_eq!(deserialized.database_name, "test");
+    }
+    #[test]
+    fn existing_config_defaults_to_automatic_collection_enrollment() {
+        let config: Config = toml::from_str("watch_clipboard = false\n").unwrap();
+        assert!(config.auto_add_collections);
+        let manual: Config = toml::from_str("auto_add_collections = false\n").unwrap();
+        assert!(!manual.auto_add_collections);
     }
 }

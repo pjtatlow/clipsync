@@ -35,7 +35,7 @@ pub async fn run(username: String, invite_code: Option<String>) -> Result<()> {
     let device_name = gethostname::gethostname().to_string_lossy().to_string();
 
     // Ensure config exists
-    let config = Config::load().unwrap_or_default();
+    let config = Config::load()?;
     config.save()?;
 
     println!("Connecting to SpacetimeDB...");
