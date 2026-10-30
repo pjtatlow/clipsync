@@ -187,7 +187,39 @@ fn live_two_device_sync_conflict_resolution_and_rollback() {
     fs::write(&path_a, "initial\n").unwrap();
     add(&mut a, &name, path_a.clone());
     add(&mut b, &name, path_b.clone());
-    a.queue(&name, snapshot("initial\n")).unwrap();
+    // Seed a legacy revision, then verify the first v2 write enables retention.
+    let legacy_id = uuid::Uuid::new_v4().to_string();
+    let legacy = seal(
+        &a.identity,
+        Envelope {
+            version: 1,
+            sequence: None,
+            collection: name.clone(),
+            id: legacy_id.clone(),
+            parent: String::new(),
+            snapshot: snapshot("initial\n"),
+        },
+    )
+    .unwrap();
+    let (seed_tx, seed_rx) = std::sync::mpsc::channel();
+    conn1
+        .reducers
+        .publish_file_revision_then(
+            name.clone(),
+            String::new(),
+            legacy_id,
+            a.device.clone(),
+            legacy,
+            move |_, result| {
+                let _ = seed_tx.send(result);
+            },
+        )
+        .unwrap();
+    seed_rx
+        .recv_timeout(Duration::from_secs(15))
+        .unwrap()
+        .unwrap()
+        .unwrap();
     // Do not let an empty new receiver publish until its initial subscription is ready.
     wait(|| {
         a.refresh();
@@ -264,7 +296,7 @@ fn live_two_device_sync_conflict_resolution_and_rollback() {
     });
     a.command(FileCommand::Rollback {
         name: name.clone(),
-        commit: initial,
+        commit: initial.clone(),
     })
     .unwrap();
     wait(|| {
@@ -416,6 +448,110 @@ fn live_two_device_sync_conflict_resolution_and_rollback() {
         }
         selected.push(new_name);
     }
+    // Leave B and C offline past the cloud window, including one local edit.
+    let offline_base = b.registry.collections[&name].base.clone();
+    fs::write(home.join("config"), "offline conflicting edit").unwrap();
+    for index in 0..45 {
+        let text = format!("retained-{index}\n");
+        fs::write(&path_a, &text).unwrap();
+        a.queue(&name, snapshot(&text)).unwrap();
+        wait(|| {
+            a.refresh();
+            a.tick(&name).unwrap();
+            a.registry.collections[&name].pending.is_none()
+        });
+        let rows: Vec<_> = a
+            .remote
+            .as_ref()
+            .unwrap()
+            .revisions
+            .iter()
+            .filter(|r| r.collection == name)
+            .collect();
+        assert!(rows.len() <= 20);
+    }
+    assert!(
+        !a.remote
+            .as_ref()
+            .unwrap()
+            .revisions
+            .iter()
+            .any(|r| r.id == offline_base)
+    );
+    wait(|| {
+        b.refresh();
+        b.tick(&name).unwrap();
+        fs::read_to_string(&path_b).unwrap() == "retained-44\n"
+    });
+    c.refresh();
+    c.tick(&name).unwrap();
+    assert_eq!(
+        fs::read_to_string(home.join("config")).unwrap(),
+        "offline conflicting edit"
+    );
+    assert!(c.registry.collections[&name].conflict.is_some());
+    assert!(
+        a.git(&name, &["rev-list", "--count", "HEAD"])
+            .unwrap()
+            .trim()
+            .parse::<usize>()
+            .unwrap()
+            > 45
+    );
+    assert_eq!(
+        a.historical_snapshot(&name, &initial).unwrap(),
+        snapshot("initial\n")
+    );
+    // A legacy writer must not bypass retention after a collection opts in.
+    let (legacy_tx, legacy_rx) = std::sync::mpsc::channel();
+    conn1
+        .reducers
+        .publish_file_revision_then(
+            name.clone(),
+            a.head(&name),
+            uuid::Uuid::new_v4().to_string(),
+            a.device.clone(),
+            vec![1],
+            move |_, result| {
+                let _ = legacy_tx.send(result);
+            },
+        )
+        .unwrap();
+    assert!(
+        legacy_rx
+            .recv_timeout(Duration::from_secs(15))
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
+    let before = a.head(&name);
+    let (bad_tx, bad_rx) = std::sync::mpsc::channel();
+    conn1
+        .reducers
+        .publish_file_revision_v_2_then(
+            name.clone(),
+            before.clone(),
+            uuid::Uuid::new_v4().to_string(),
+            a.device.clone(),
+            vec![1],
+            a.registry.collections[&name].sequence,
+            move |_, result| {
+                let _ = bad_tx.send(result);
+            },
+        )
+        .unwrap();
+    assert!(
+        bad_rx
+            .recv_timeout(Duration::from_secs(15))
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
+    a.refresh();
+    assert_eq!(a.head(&name), before);
+    eprintln!(
+        "Cloud history stayed at 20 snapshots; offline catchup, conflicts and local history verified"
+    );
     // Delete fixture heads, encrypted history, acknowledgements and destinations,
     // rather than leaving test collections visible in bootstrap previews.
     // A stale reviewed head must not delete a collection.

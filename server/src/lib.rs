@@ -563,8 +563,127 @@ pub struct FileApplied {
     pub applied_at: Timestamp,
 }
 
+/// One bounded counter per collection. Ciphertext carries the authenticated copy.
+#[table(accessor = file_retention)]
+pub struct FileRetention {
+    #[primary_key]
+    key: String,
+    #[index(btree)]
+    user_id: u64,
+    collection: String,
+    sequence: u64,
+}
+
+const CLOUD_REVISIONS: usize = 20;
+
+#[reducer]
+pub fn publish_file_revision_v2(
+    ctx: &ReducerContext,
+    collection: String,
+    expected: String,
+    revision: String,
+    device_id: String,
+    encrypted_data: Vec<u8>,
+    sequence: u64,
+) -> Result<(), String> {
+    let user_id = get_user_id(ctx)?;
+    let key = format!("{user_id}:{collection}");
+    let previous = ctx.db.file_retention().key().find(&key);
+    // Byte-identical retries remain safe even after subsequent publications.
+    if ctx.db.file_revision().id().find(&revision).is_some() {
+        return publish_revision(
+            ctx,
+            collection,
+            expected,
+            revision,
+            device_id,
+            encrypted_data,
+        );
+    }
+    let next = previous
+        .as_ref()
+        .map_or(Some(1), |r| r.sequence.checked_add(1));
+    if next != Some(sequence) {
+        return Err("Revision sequence changed; reconcile before retrying".into());
+    }
+    publish_revision(
+        ctx,
+        collection.clone(),
+        expected,
+        revision.clone(),
+        device_id,
+        encrypted_data,
+    )?;
+    let row = FileRetention {
+        key,
+        user_id,
+        collection: collection.clone(),
+        sequence,
+    };
+    if previous.is_some() {
+        ctx.db.file_retention().key().update(row);
+    } else {
+        ctx.db.file_retention().insert(row);
+    }
+    // Walk the accepted chain, never wall-clock timestamps or client-supplied order.
+    let mut keep = std::collections::BTreeSet::new();
+    let mut current = revision;
+    for _ in 0..CLOUD_REVISIONS {
+        if current.is_empty() || !keep.insert(current.clone()) {
+            break;
+        }
+        let Some(row) = ctx.db.file_revision().id().find(&current) else {
+            break;
+        };
+        current = row.parent;
+    }
+    let obsolete: Vec<_> = ctx
+        .db
+        .file_revision()
+        .user_id()
+        .filter(&user_id)
+        .filter(|r| r.collection == collection && !keep.contains(&r.id))
+        .map(|r| r.id)
+        .collect();
+    for id in obsolete {
+        ctx.db.file_revision().id().delete(&id);
+    }
+    // Device status can outlive its snapshot; stale acknowledgements are not pins.
+    Ok(())
+}
+
 #[reducer]
 pub fn publish_file_revision(
+    ctx: &ReducerContext,
+    collection: String,
+    expected: String,
+    revision: String,
+    device_id: String,
+    encrypted_data: Vec<u8>,
+) -> Result<(), String> {
+    let user_id = get_user_id(ctx)?;
+    if ctx
+        .db
+        .file_retention()
+        .key()
+        .find(&format!("{user_id}:{collection}"))
+        .is_some()
+    {
+        return Err(
+            "Upgrade ClipSync to publish to a collection with bounded cloud history".into(),
+        );
+    }
+    publish_revision(
+        ctx,
+        collection,
+        expected,
+        revision,
+        device_id,
+        encrypted_data,
+    )
+}
+
+fn publish_revision(
     ctx: &ReducerContext,
     collection: String,
     expected: String,
@@ -767,6 +886,7 @@ pub fn delete_file_collection(
         for key in acknowledgements {
             ctx.db.file_applied().key().delete(&key);
         }
+        ctx.db.file_retention().key().delete(&format!("{user_id}:{name}"));
         ctx.db
             .file_head()
             .key()

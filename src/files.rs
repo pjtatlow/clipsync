@@ -133,6 +133,8 @@ impl Snapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Envelope {
     version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sequence: Option<u64>,
     collection: String,
     id: String,
     parent: String,
@@ -174,6 +176,8 @@ fn open(identity: &age::x25519::Identity, encrypted: &[u8]) -> Result<Envelope> 
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Pending {
+    #[serde(default)]
+    sequence: u64,
     id: String,
     parent: String,
     snapshot: Snapshot,
@@ -186,6 +190,8 @@ struct Applying {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Collection {
+    #[serde(default)]
+    sequence: u64,
     path: PathBuf,
     directory: bool,
     #[serde(default)]
@@ -370,6 +376,7 @@ impl Engine {
             &self.identity,
             Envelope {
                 version: 1,
+                sequence: None,
                 collection: name.into(),
                 id: uuid::Uuid::new_v4().to_string(),
                 parent: String::new(),
@@ -445,13 +452,16 @@ impl Engine {
             .unwrap_or_default()
     }
     fn decode(&self, name: &str, id: &str) -> Result<Snapshot> {
+        Ok(self.decode_envelope(name, id)?.snapshot)
+    }
+    fn decode_envelope(&self, name: &str, id: &str) -> Result<Envelope> {
         let row = self
             .remote
             .as_ref()
             .and_then(|r| r.revisions.iter().find(|r| r.id == id))
             .context("Revision has not arrived yet")?;
         let env = open(&self.identity, &row.encrypted_data)?;
-        if env.version != 1
+        if !matches!((env.version, env.sequence), (1, None) | (2, Some(1..)))
             || env.collection != name
             || env.id != id
             || env.parent != row.parent
@@ -460,9 +470,27 @@ impl Engine {
             bail!("Revision metadata mismatch");
         }
         env.snapshot.validate()?;
-        Ok(env.snapshot)
+        Ok(env)
+    }
+    fn revision_sequence(&self, name: &str, id: &str) -> Result<u64> {
+        Ok(self.decode_envelope(name, id)?.sequence.unwrap_or(0))
     }
     fn verify_descendant(&self, name: &str, head: &str, base: &str) -> Result<()> {
+        let incoming = self.decode_envelope(name, head)?;
+        let installed = self
+            .registry
+            .collections
+            .get(name)
+            .map_or(0, |c| c.sequence);
+        if let Some(sequence) = incoming.sequence {
+            if base.is_empty() || sequence > installed || (head == base && sequence == installed) {
+                return Ok(());
+            }
+            bail!("Server head is not newer than the installed revision");
+        }
+        if installed > 0 {
+            bail!("Cannot replace a sequenced revision with a legacy revision");
+        }
         let mut current = head.to_string();
         let mut visited = std::collections::BTreeSet::new();
         while current != base {
@@ -488,8 +516,13 @@ impl Engine {
         validate_shell(&snapshot, &self.registry.collections[name].path)?;
         let id = uuid::Uuid::new_v4().to_string();
         let parent = self.registry.collections[name].base.clone();
+        let sequence = self.registry.collections[name]
+            .sequence
+            .checked_add(1)
+            .context("Revision sequence exhausted")?;
         let env = Envelope {
-            version: 1,
+            version: 2,
+            sequence: Some(sequence),
             collection: name.into(),
             id: id.clone(),
             parent: parent.clone(),
@@ -507,6 +540,7 @@ impl Engine {
         let previous = self.registry.collections[name].clone();
         let c = self.registry.collections.get_mut(name).unwrap();
         c.pending = Some(Pending {
+            sequence,
             id,
             parent,
             snapshot,
@@ -620,6 +654,7 @@ impl Engine {
                 });
                 if accepted {
                     let c = self.registry.collections.get_mut(name).unwrap();
+                    c.sequence = p.sequence;
                     c.base = p.id.clone();
                     c.installed = p.snapshot.clone();
                     c.pending = None;
@@ -640,7 +675,9 @@ impl Engine {
                 {
                     // Joining with exactly the same bytes needs no deployment or conflict.
                     self.record(name, &incoming, &format!("adopt matching {head}"))?;
+                    let sequence = self.revision_sequence(name, &head)?;
                     let c = self.registry.collections.get_mut(name).unwrap();
+                    c.sequence = sequence;
                     c.base = head;
                     c.installed = incoming;
                     c.error = None;
@@ -670,12 +707,13 @@ impl Engine {
                     revision: p.id.clone(),
                     device_id: self.device.clone(),
                     encrypted_data: p.encrypted.clone(),
+                    sequence: p.sequence,
                 })?;
             }
             // Further edits stay on disk; capture immediately after this revision is acknowledged.
             return Ok(());
         }
-        if local != c.installed || c.base.is_empty() {
+        if local != c.installed || c.base.is_empty() || c.sequence == 0 {
             let hash = local.hash()?;
             let observation = self
                 .observed
@@ -697,6 +735,7 @@ impl Engine {
         Ok(())
     }
     fn apply(&mut self, name: &str, revision: &str, snapshot: Snapshot) -> Result<()> {
+        let sequence = self.revision_sequence(name, revision)?;
         let c = self.registry.collections[name].clone();
         if snapshot.directory != c.directory {
             bail!("Collection type differs between devices");
@@ -717,6 +756,7 @@ impl Engine {
             bail!("Destination changed during application; recovery required");
         }
         let c = self.registry.collections.get_mut(name).unwrap();
+        c.sequence = sequence;
         c.base = revision.into();
         c.installed = snapshot;
         c.applying = None;
@@ -768,6 +808,7 @@ impl Engine {
                 self.registry.collections.insert(
                     name.clone(),
                     Collection {
+                        sequence: 0,
                         path,
                         directory,
                         base: String::new(),
@@ -950,7 +991,9 @@ impl Engine {
                     Resolution::Local => {
                         let remote = self.decode(&name, &head)?;
                         self.record(&name, &remote, &format!("preserve rejected remote {head}"))?;
+                        let sequence = self.revision_sequence(&name, &head)?;
                         let state = self.registry.collections.get_mut(&name).unwrap();
+                        state.sequence = sequence;
                         state.base = head;
                         state.pending = None;
                         state.conflict = None;
@@ -1343,6 +1386,7 @@ mod tests {
             &e.identity,
             Envelope {
                 version: 1,
+                sequence: None,
                 collection: name.into(),
                 id: id.into(),
                 parent: parent.into(),
@@ -1492,7 +1536,7 @@ mod tests {
         add(&mut e, "test", path.clone());
         e.queue("test", snapshot("mine")).unwrap();
         let pending = e.registry.collections["test"].pending.clone().unwrap();
-        let mut r = remote(&e, "test", "newer", &pending.id, snapshot("newer"));
+        let mut r = sequenced_remote(&e, "newer", &pending.id, 2, "newer");
         std::sync::Arc::make_mut(&mut r.revisions).push(crate::module_bindings::FileRevision {
             id: pending.id.clone(),
             user_id: 1,
@@ -1555,6 +1599,7 @@ mod tests {
         let (identity, recipient) = crypto::generate_keypair();
         let envelope = Envelope {
             version: 1,
+            sequence: None,
             collection: "test".into(),
             id: "forged".into(),
             parent: String::new(),
@@ -1825,5 +1870,6 @@ mod tests {
     include!("files/cleanup_tests.rs");
     include!("files/bootstrap_tests.rs");
     include!("files/discovery_tests.rs");
+    include!("files/retention_tests.rs");
     include!("files_live_tests.rs");
 }

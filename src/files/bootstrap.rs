@@ -118,7 +118,8 @@ impl Engine {
                 let encrypted = seal(
                     &self.identity,
                     Envelope {
-                        version: 1,
+                        version: 2,
+                        sequence: Some(1),
                         collection: destination_collection(&name),
                         id: id.clone(),
                         parent: String::new(),
@@ -128,6 +129,7 @@ impl Engine {
                 self.registry.destinations.insert(
                     name.clone(),
                     Pending {
+                        sequence: 1,
                         id,
                         parent: String::new(),
                         snapshot,
@@ -147,6 +149,7 @@ impl Engine {
                     revision: pending.id.clone(),
                     device_id: self.device.clone(),
                     encrypted_data: pending.encrypted.clone(),
+                    sequence: pending.sequence,
                 })?;
             }
         }

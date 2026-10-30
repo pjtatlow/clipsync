@@ -287,3 +287,34 @@ different local files are checked for preservation. On success, fixtures, destin
 metadata, acknowledgements and device registrations are deleted. An empty isolated test
 account may remain, but no test collections are published into the normal account.
 The test does not modify the clipboard or existing managed configuration files.
+
+## Cloud retention (0.9.0)
+
+Maincloud retains the latest **20 complete encrypted snapshots per collection**.
+Each accepted v2 publication atomically prunes older cloud snapshots. The current
+snapshot is always retained; device acknowledgements and unresolved local conflicts
+never pin old cloud payloads. Destination metadata uses the same bounded protocol.
+This bounds revision storage per collection; adding collections or increasing their
+size still increases usage.
+
+Local encrypted Git history is unchanged and is not automatically pruned. You can
+still roll back to a locally saved revision that no longer exists on Maincloud;
+rollback publishes it as a new revision.
+
+Upgrade and restart **all machines** to 0.9.0 or newer. The server deploy is additive
+and leaves legacy collections unchanged until an upgraded daemon publishes. A clean,
+registered legacy collection automatically publishes a sequenced checkpoint even
+without edits, enabling cloud retention. Conflicting or pending work is preserved
+and must finish or be resolved before that checkpoint. Once enabled, older daemons
+cannot read or publish that collection; clipboard sync is unaffected.
+
+New snapshots include an encrypted, sender-authenticated monotonic sequence. Receivers
+persist their installed sequence and reject older or equal-sequence alternate heads,
+so a long-offline machine can safely catch up without downloading deleted ancestry.
+Offline edits still become conflicts rather than being overwritten. If a publication's
+acknowledgement was lost and its cloud snapshot has already expired, the pending edit
+is conservatively preserved as a conflict for explicit resolution.
+
+Pruning cloud history does not provide a replacement for backups: a new machine can
+only retrieve snapshots still in Maincloud, while older rollback history stays on
+machines that recorded it locally.

@@ -36,6 +36,7 @@ pub enum SpacetimeCommand {
         reply: std::sync::mpsc::Sender<Option<crate::files::RemoteState>>,
     },
     PublishFile {
+        sequence: u64,
         collection: String,
         expected: String,
         revision: String,
@@ -287,22 +288,35 @@ fn handle_command(
             });
         }
         SpacetimeCommand::PublishFile {
+            sequence,
             collection,
             expected,
             revision,
             device_id,
             encrypted_data,
         } => {
-            if ready
-                && let Err(e) = conn.reducers.publish_file_revision(
-                    collection,
-                    expected,
-                    revision,
-                    device_id,
-                    encrypted_data,
-                )
-            {
-                warn!("File publication failed; will retry: {e}");
+            if ready {
+                let result = if sequence == 0 {
+                    conn.reducers.publish_file_revision(
+                        collection,
+                        expected,
+                        revision,
+                        device_id,
+                        encrypted_data,
+                    )
+                } else {
+                    conn.reducers.publish_file_revision_v_2(
+                        collection,
+                        expected,
+                        revision,
+                        device_id,
+                        encrypted_data,
+                        sequence,
+                    )
+                };
+                if let Err(e) = result {
+                    warn!("File publication failed; will retry: {e}");
+                }
             }
         }
         SpacetimeCommand::AcknowledgeFile {
